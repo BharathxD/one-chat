@@ -1,204 +1,117 @@
-import { useCopyToClipboard } from "@/hooks/use-copy-to-clipboard";
-import { type Model, type ModelConfig, getModelByKey } from "@/lib/ai";
 import { useSession } from "@/lib/auth/client";
-import { trpc } from "@/lib/trpc/client";
-import { generateUUID, resolveModel, setModelCookie } from "@/lib/utils";
-import type { MessageWithMetadata } from "@/types";
-import type { UseChatHelpers } from "@ai-sdk/react";
-import type { SourceUIPart } from "@ai-sdk/ui-utils";
-import { useQueryClient } from "@tanstack/react-query";
-import { toast } from "@workspace/ui/components/sonner";
-import { useRouter } from "next/navigation";
-import { useCallback, useEffect, useMemo, useState } from "react";
-import type { Dispatch, SetStateAction } from "react";
-
-interface UseMessageLogicProps {
-  threadId: string;
-  message: MessageWithMetadata;
-  setMessages: UseChatHelpers["setMessages"];
-  reload: UseChatHelpers["reload"];
-  messageModel: Model;
+import type { Message as AiSDKMessage } from "ai"; // This is from Vercel AI SDK
+import { useMutation, useQueryClient } from "@tanstack/react-query"; // Changed
+import { apiClient, ApiError } from "@/lib/api-client"; // Changed
+import type { ApiThread } from "@/components/thread/thread-list"; // Changed
+// Define response for delete operations if not already globally available
+interface DeletionResponse {
+  deleted_count: number;
+  message: string;
 }
 
-export const useMessageLogic = ({
-  threadId,
-  message,
-  setMessages,
-  reload,
-  messageModel,
-}: UseMessageLogicProps): {
-  displayMode: "view" | "edit";
-  setDisplayMode: Dispatch<SetStateAction<"view" | "edit">>;
-  messageModelConfig: ModelConfig | false | null;
-  sources: SourceUIPart["source"][];
-  isBranchingThread: boolean;
-  isReloading: boolean;
-  handleMessageReload: (model?: Model) => Promise<void>;
-  handleThreadBranchOut: (model?: Model) => void;
-  handleTextCopy: (textContent: string) => Promise<void>;
-} => {
+
+import { nanoid } from "nanoid";
+import { useRouter } from "next/navigation";
+import { toast } from "@workspace/ui/components/sonner";
+
+interface UseMessageLogicProps {
+  threadId?: string; // Current thread ID
+  // Add other props if the hook needs them, e.g., current messages list for context
+}
+
+export const useMessageLogic = ({ threadId }: UseMessageLogicProps) => {
   const router = useRouter();
-  const [_, copyToClipboard] = useCopyToClipboard();
-  const [displayMode, setDisplayMode] = useState<"view" | "edit">("view");
-  const [isBranchingThread, setIsBranchingThread] = useState(false);
   const queryClient = useQueryClient();
   const { data: session } = useSession();
+  const user = session?.user;
 
-  const trpcUtils = trpc.useUtils();
-  const deleteMessageAndTrailingMutation =
-    trpc.thread.deleteMessageAndTrailing.useMutation();
-  const branchOutMutation = trpc.thread.branchOut.useMutation({
-    onMutate: async ({
-      originalThreadId,
-      newThreadId,
-    }: {
-      originalThreadId: string;
-      newThreadId: string;
-    }) => {
-      setIsBranchingThread(true);
-      await trpcUtils.thread.getUserThreads.cancel();
-      const previousThreads = trpcUtils.thread.getUserThreads.getData();
-      if (!session?.user?.id) return { previousThreads };
-
-      // Optimistically add the new thread
-      trpcUtils.thread.getUserThreads.setData(undefined, (old) => {
-        if (!old) return old;
-        const optimisticThread = {
-          id: newThreadId,
-          title: "Cloning...",
-          userId: session.user.id,
-          originThreadId: originalThreadId ?? null,
-          visibility: "private" as const,
-          createdAt: new Date().toISOString(),
-          updatedAt: new Date().toISOString(),
-          lastMessageAt: new Date().toISOString() as string | null,
-        };
-        return [optimisticThread, ...old];
-      });
-      return { previousThreads };
+  // Mutation for deleting a message and its trailing messages
+  const deleteMessageAndTrailingMutation = useMutation<
+    DeletionResponse, // Assuming this is the response from Axum
+    ApiError,
+    { messageId: string }
+  >({
+    mutationFn: async ({ messageId }) => {
+      return apiClient.post<DeletionResponse>(
+        `/messages/${messageId}/delete-inclusive-trailing`
+      );
     },
-    onSuccess: (data) => router.push(`/thread/${data.newThreadId}`),
-    onError: (error, _vars, context) => {
-      if (context?.previousThreads) {
-        trpcUtils.thread.getUserThreads.setData(
-          undefined,
-          context.previousThreads
-        );
+    onSuccess: (data) => {
+      toast.success(data.message || `${data.deleted_count} message(s) removed.`);
+      if (threadId) {
+        queryClient.invalidateQueries({ queryKey: ["messages", threadId] });
       }
-      console.error("Failed to branch out:", error);
-      const errorMessage = error.message.includes("Unauthorized")
-        ? "You don't have permission to branch this thread"
-        : error.message.includes("not found")
-          ? "Message or thread not found"
-          : "Failed to branch out. Please try again.";
-      toast.error(errorMessage);
+      queryClient.invalidateQueries({ queryKey: ["userThreads"] });
     },
-    onSettled: () => {
-      setIsBranchingThread(false);
-      queryClient.invalidateQueries({ queryKey: ["thread-list"] });
-      trpcUtils.thread.getUserThreads.invalidate();
+    onError: (error) => {
+      toast.error(`Failed to remove message(s): ${error.message}`);
     },
   });
 
-  // Memoized computations
-  const resolvedModel = useMemo(() => resolveModel(message), [message]);
+  // Mutation for branching out a new thread
+  const branchOutMutation = useMutation<
+    ApiThread, // Axum returns the new thread
+    ApiError,
+    { originalThreadId: string; anchorMessageId: string; newThreadId?: string },
+    { previousThreads?: ApiThread[] } // Context for optimistic update
+  >({
+    mutationFn: async ({ originalThreadId, anchorMessageId, newThreadId }) => {
+      return apiClient.post<ApiThread, { anchor_message_id: string; new_thread_id?: string }>(
+        `/threads/${originalThreadId}/branch`,
+        { anchor_message_id: anchorMessageId, new_thread_id: newThreadId }
+      );
+    },
+    onMutate: async (variables) => {
+      // Optimistically add a placeholder or navigate immediately then update.
+      // For simplicity, we can just invalidate and let react-query handle refetch.
+      // Or, more advanced:
+      await queryClient.cancelQueries({ queryKey: ["userThreads"] });
+      const previousThreads = queryClient.getQueryData<ApiThread[]>(["userThreads"]);
 
-  const messageModelConfig = useMemo(
-    () =>
-      message.role === "assistant" &&
-      resolvedModel &&
-      getModelByKey(resolvedModel),
-    [message.role, resolvedModel]
-  );
-
-  const sources = useMemo((): SourceUIPart["source"][] => {
-    return (
-      message.parts
-        ?.filter((part) => part.type === "source")
-        ?.map((part) => (part as { source: SourceUIPart["source"] }).source) ||
-      []
-    );
-  }, [message.parts]);
-
-  // biome-ignore lint/correctness/useExhaustiveDependencies: Event handlers
-  const handleMessageReload = useCallback(
-    async (model?: Model) => {
-      try {
-        setMessages((messages) => {
-          const currentIndex = messages.findIndex((m) => m.id === message.id);
-          if (currentIndex === -1) return messages;
-
-          // For user messages: delete from next message, for assistant: delete from current
-          const deleteFromIndex =
-            message.role === "user" ? currentIndex + 1 : currentIndex;
-          const targetMessage = messages[deleteFromIndex];
-
-          if (!targetMessage) return messages;
-
-          // Delete from database
-          deleteMessageAndTrailingMutation.mutate({
-            messageId: targetMessage.id,
-          });
-
-          // Update local state
-          return messages.slice(0, deleteFromIndex);
-        });
-        await reload({
-          body: {
-            selectedModel: model || messageModel,
-          },
-        });
-      } catch (error) {
-        console.error("Failed to reload from message:", error);
+      // Add a temporary new thread optimistically (optional, can be complex)
+      // For now, we'll rely on onSuccess navigation and invalidation.
+      return { previousThreads };
+    },
+    onSuccess: (newThread) => {
+      toast.success(`Branched into new thread: ${newThread.title}`);
+      queryClient.invalidateQueries({ queryKey: ["userThreads"] });
+      // Navigate to the new thread
+      router.push(`/chat/${newThread.id}`);
+    },
+    onError: (error, variables, context) => {
+      if (context?.previousThreads) {
+        queryClient.setQueryData<ApiThread[]>(["userThreads"], context.previousThreads);
       }
+      toast.error(`Failed to branch thread: ${error.message}`);
     },
-    [
-      deleteMessageAndTrailingMutation,
-      message.id,
-      message.role,
-      setMessages,
-      reload,
-    ]
-  );
+    // onSettled: () => { // Already handled by onSuccess invalidation
+    //   queryClient.invalidateQueries({ queryKey: ["userThreads"] });
+    // },
+  });
 
-  const handleThreadBranchOut = useCallback(
-    (model?: Model) => {
-      const newThreadId = generateUUID();
-      if (model) setModelCookie(model);
-      branchOutMutation.mutate({
-        messageId: message.id,
-        originalThreadId: threadId,
-        newThreadId,
-      });
-      // Optimistically navigate immediately
-      router.push(`/thread/${newThreadId}?branch=true`);
-    },
-    [branchOutMutation, message.id, threadId, router]
-  );
 
-  const handleTextCopy = useCallback(
-    async (textContent: string) => {
-      await copyToClipboard(textContent);
-    },
-    [copyToClipboard]
-  );
+  const handleDeleteMessageAndFollowing = (message: AiSDKMessage) => {
+    if (!user) return;
+    if (window.confirm("Are you sure you want to delete this message and all following messages?")) {
+      deleteMessageAndTrailingMutation.mutate({ messageId: message.id });
+    }
+  };
 
-  // Cleanup effect
-  useEffect(() => {
-    return () => {
-      if (isBranchingThread) setIsBranchingThread(false);
-    };
-  }, [isBranchingThread]);
+  const handleBranchOut = (message: AiSDKMessage) => {
+    if (!user || !threadId) return; // Must have an original threadId to branch from
+
+    const newThreadIdClient = nanoid(); // Generate a client-side ID for the new thread (can be suggestion)
+    branchOutMutation.mutate({
+      originalThreadId: threadId,
+      anchorMessageId: message.id,
+      newThreadId: newThreadIdClient,
+    });
+  };
 
   return {
-    displayMode,
-    setDisplayMode,
-    messageModelConfig,
-    sources,
-    isBranchingThread,
-    isReloading: deleteMessageAndTrailingMutation.isPending,
-    handleMessageReload,
-    handleThreadBranchOut,
-    handleTextCopy,
+    handleDeleteMessageAndFollowing,
+    isLoadingDelete: deleteMessageAndTrailingMutation.isPending,
+    handleBranchOut,
+    isLoadingBranchOut: branchOutMutation.isPending,
   };
 };

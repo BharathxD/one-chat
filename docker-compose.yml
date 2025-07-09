@@ -1,0 +1,81 @@
+version: '3.8'
+
+services:
+  mongodb:
+    image: mongo:7.0 # Use a specific version of Mongo
+    container_name: chat_mongodb
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    environment:
+      # MONGO_INITDB_ROOT_USERNAME: root # Optional: set if you need auth from the start
+      # MONGO_INITDB_ROOT_PASSWORD: rootpassword # Optional
+      MONGO_INITDB_DATABASE: axum_chat_db # Default database to create (matches default in api/src/db.rs)
+    restart: unless-stopped
+    healthcheck:
+      test: |
+        mongosh --eval 'try { rs.status().ok } catch (err) { db.adminCommand("ping").ok }' --quiet
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  redis:
+    image: redis:7.2-alpine # Use a specific version of Redis
+    container_name: chat_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  axum_api:
+    container_name: chat_axum_api
+    build:
+      context: ./api # Path to the Dockerfile for the Axum API
+      dockerfile: Dockerfile
+    ports:
+      - "3001:3001" # Expose Axum API port (assuming it runs on 3001 inside container)
+    depends_on:
+      mongodb:
+        condition: service_healthy # Wait for MongoDB to be healthy
+      redis:
+        condition: service_healthy   # Wait for Redis to be healthy
+    environment:
+      # These should match what your Axum app expects.
+      # For local dev, you might have a .env file inside ./api that Dockerfile doesn't copy,
+      # and these env vars here would take precedence or be the source.
+      # Or, the app reads from .env file if present inside the container (not recommended for prod images).
+      # Best practice: rely on environment variables injected by docker-compose.
+      RUST_LOG: "api=debug,tower_http=debug,hyper=info"
+      SERVER_PORT: 3001 # Port inside the container
+      DATABASE_URL: "mongodb://mongodb:27017/axum_chat_db" # Use service name 'mongodb'
+      REDIS_URL: "redis://redis:6379/" # Use service name 'redis'
+      JWT_SECRET: "your-local-dev-jwt-secret-at-least-32-chars-long" # Change this!
+      JWT_EXPIRATION_HOURS: 24
+      OPENAI_API_KEY: "" # Optional: set if you have a default server key
+      VERCEL_BLOB_READ_WRITE_TOKEN: "" # If attachments are used and need this
+      # NEXT_PUBLIC_APP_URL: "http://localhost:3000" # If needed by API for things like OpenRouter referer
+      # NEXT_PUBLIC_APP_NAME: "LocalDevChatApp"
+    restart: unless-stopped
+    # volumes:
+      # - ./api:/app # Mount local api code for hot-reloading if dev setup supports it (e.g. with cargo-watch)
+      # This is more for dev convenience; for prod-like testing, build the image.
+
+volumes:
+  mongo_data:
+  redis_data:
+
+# Note: The original apps/web/docker-compose.yml for Postgres can remain if that part of the app
+# (or other apps in the monorepo) still needs it. Or, it could be merged here if desired.
+# This new docker-compose.yml focuses on the Axum API and its dependencies.
+# To run the Next.js frontend (apps/web) alongside, you could either:
+# 1. Run it directly on your host: `pnpm --filter web dev`
+# 2. Add another service definition for it in this docker-compose.yml.

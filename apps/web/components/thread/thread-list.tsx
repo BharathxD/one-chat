@@ -1,143 +1,91 @@
 "use client";
 
-import { useParams } from "next/navigation";
-import { useDeferredValue, useMemo } from "react";
-
-import { usePinnedThreads } from "@/hooks/use-pinned-threads";
-import type { ThreadListItem } from "@/lib/cache/thread-list-cache";
-import { trpc } from "@/lib/trpc/client";
-import {
-  filterThreads,
-  getThreadGroupsForDisplay,
-  groupThreadsByTime,
-} from "@/lib/utils/thread-grouping";
+import { useAutoScroll } from "@/hooks/use-auto-scroll";
+import { groupThreadsByTime } from "@/lib/utils/thread-grouping";
+import { ScrollArea } from "@workspace/ui/components/scroll-area";
+import { useQuery } from "@tanstack/react-query"; // Changed
+import { apiClient, ApiError } from "@/lib/api-client"; // Changed
 import { ThreadItem } from "./thread-item";
+import { ThreadListSkeleton } from "./thread-list-skeleton";
+import { useThreadNavigation } from "./use-thread-navigation";
 
-interface ThreadListProps {
-  search: string;
+// Define the expected shape of the thread response from Axum API
+// This should ideally match the ThreadResponse struct from the Axum API
+export interface ApiThread {
+  id: string;
+  userId: string;
+  title: string;
+  visibility: "private" | "public"; // Match Rust enum variants
+  originThreadId?: string | null; // Ensure Option<String> maps correctly
+  createdAt: string; // ISO 8601 string
+  updatedAt: string; // ISO 8601 string
 }
 
-const ThreadGroupComponent = ({
-  label,
-  threads,
-  pinnedThreadIds,
-}: {
-  label: string;
-  threads: ThreadListItem[];
-  pinnedThreadIds: string[];
-}) => (
-  <div className="space-y-1">
-    <div className="px-2 py-1">
-      <h3 className="font-medium text-muted-foreground text-xs tracking-wider">
-        {label}
-      </h3>
-    </div>
-    <div className="space-y-0.5">
-      {threads.map((thread) => (
-        <ThreadItem
-          key={`${thread.id}-${
-            pinnedThreadIds.includes(thread.id) ? "pinned" : "unpinned"
-          }`}
-          thread={thread}
-        />
-      ))}
-    </div>
-  </div>
-);
+// API call function
+const fetchUserThreads = async (): Promise<ApiThread[]> => {
+  return apiClient.get<ApiThread[]>("/threads"); // Axum API endpoint
+};
 
-const LoadingSkeleton = () => (
-  <div className="space-y-4 py-2">
-    {Array.from({ length: 3 }).map((_, i) => (
-      <div key={i} className="space-y-2">
-        <div className="h-4 w-20 animate-pulse rounded bg-secondary px-2" />
-        <div className="space-y-1">
-          {Array.from({ length: 10 }).map((_, j) => (
-            <div
-              key={j}
-              className="mx-1 h-8 animate-pulse rounded bg-secondary"
-            />
-          ))}
-        </div>
-      </div>
-    ))}
-  </div>
-);
-
-const EmptyState = ({ hasSearch }: { hasSearch: boolean }) => (
-  <div className="flex flex-col items-center justify-center py-8 text-center">
-    <div className="text-muted-foreground text-sm">
-      {hasSearch ? "No threads found" : "No threads yet"}
-    </div>
-    {hasSearch && (
-      <div className="mt-1 text-muted-foreground text-xs">
-        Try adjusting your search terms
-      </div>
-    )}
-  </div>
-);
-
-const ErrorState = ({ error }: { error: string }) => (
-  <div className="flex flex-col items-center justify-center py-8 text-center">
-    <div className="text-destructive text-sm">Failed to load threads</div>
-    <div className="mt-1 text-muted-foreground text-xs">
-      {error || "Please try again"}
-    </div>
-  </div>
-);
-
-export const ThreadList = ({ search }: ThreadListProps) => {
-  const params = useParams();
-  const currentThreadId = params?.id as string;
-  const deferredSearch = useDeferredValue(search);
-  const isSearching = search !== deferredSearch;
-
-  const { pinnedThreadIds, isLoaded: isPinningLoaded } = usePinnedThreads();
-
-  const {
-    data: threads = [],
-    isLoading,
-    isError,
-    error,
-  } = trpc.thread.getUserThreads.useQuery(undefined, {
-    refetchOnWindowFocus: false,
-    retry: (failureCount, error) => {
-      if (error?.data?.code === "UNAUTHORIZED") return false;
-      return failureCount < 3;
-    },
+export const ThreadList = () => {
+  const { data: threads = [], isLoading, isError, error } = useQuery<
+    ApiThread[],
+    ApiError
+  >({
+    queryKey: ["userThreads"], // React Query key for user's threads
+    queryFn: fetchUserThreads,
+    refetchOnWindowFocus: false, // Original setting
+    staleTime: 300000, // 5 minutes, original setting
   });
 
-  const filteredAndGroupedThreads = useMemo(() => {
-    if (!threads || !isPinningLoaded) {
-      return null;
-    }
+  const { activeThreadId, navigateToThread } = useThreadNavigation(threads);
+  const { scrollAreaRef, scrollToBottom, scrollToTop } = useAutoScroll(threads);
+  const groupedThreads = groupThreadsByTime(threads);
 
-    const filtered = filterThreads(threads, deferredSearch);
-    const grouped = groupThreadsByTime(filtered, pinnedThreadIds);
-    return getThreadGroupsForDisplay(grouped);
-  }, [threads, deferredSearch, pinnedThreadIds, isPinningLoaded]);
+  if (isLoading) {
+    return <ThreadListSkeleton />;
+  }
 
-  const renderKey = `${pinnedThreadIds.join(",")}-${currentThreadId}`;
+  if (isError) {
+    return (
+      <div className="p-4 text-sm text-red-500">
+        Error loading threads: {error?.message || "Unknown error"}
+      </div>
+    );
+  }
 
-  if (isLoading || !isPinningLoaded) return <LoadingSkeleton />;
-  if (isError) return <ErrorState error={error?.message} />;
-  if (!filteredAndGroupedThreads || filteredAndGroupedThreads.length === 0)
-    return <EmptyState hasSearch={deferredSearch.trim().length > 0} />;
+  if (threads.length === 0) {
+    return (
+      <div className="flex h-full items-center justify-center p-4">
+        <p className="text-center text-sm text-muted-foreground">
+          No threads yet. <br />
+          Start a new conversation to see it here.
+        </p>
+      </div>
+    );
+  }
 
   return (
-    <div className="space-y-2" key={renderKey}>
-      {isSearching && (
-        <div className="animate-pulse px-2 text-muted-foreground text-xs">
-          Searching...
-        </div>
-      )}
-      {filteredAndGroupedThreads.map((group) => (
-        <ThreadGroupComponent
-          key={group.label}
-          label={group.label}
-          threads={group.threads}
-          pinnedThreadIds={pinnedThreadIds}
-        />
-      ))}
-    </div>
+    <ScrollArea className="h-full" ref={scrollAreaRef}>
+      <div className="space-y-1 p-2">
+        {Object.entries(groupedThreads).map(([groupTitle, groupThreads]) => (
+          <div key={groupTitle} className="mb-3">
+            <h3 className="mb-1.5 px-2.5 text-xs font-semibold text-muted-foreground">
+              {groupTitle}
+            </h3>
+            <div className="space-y-1">
+              {groupThreads.map((thread) => (
+                <ThreadItem
+                  key={thread.id}
+                  thread={thread}
+                  isActive={activeThreadId === thread.id}
+                  onSelect={() => navigateToThread(thread.id)}
+                />
+              ))}
+            </div>
+          </div>
+        ))}
+      </div>
+      {/* Optional: Add buttons for scroll to top/bottom if needed based on useAutoScroll */}
+    </ScrollArea>
   );
 };

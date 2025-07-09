@@ -1,386 +1,244 @@
 "use client";
 
-import { ShareButton } from "@/components/nav/share-button";
-import { ThemeButton } from "@/components/nav/theme-button";
-import { SettingsButton } from "@/components/settings/settings-button";
-import { useApiKeys } from "@/hooks/use-api-keys";
-import { useAutoResume } from "@/hooks/use-auto-resume";
-import { useUserSettings } from "@/hooks/use-user-settings";
-import type { Model } from "@/lib/ai";
+import { useChatScrollAnchor } from "@/hooks/use-chat-scroll-anchor";
+import { useEnterSubmit } from "@/hooks/use-enter-submit";
+import { useMessages } from "@/hooks/use-messages"; // This hook will need refactoring if it uses tRPC
 import { useSession } from "@/lib/auth/client";
-import { OneChatSDKError } from "@/lib/errors";
-import type { ChatRequest } from "@/lib/schema";
-import { trpc } from "@/lib/trpc/client";
-import { generateUUID } from "@/lib/utils";
-import { getRoutingFromCookie } from "@/lib/utils/cookie";
-import type { ChatSubmitData } from "@/types";
-import { useChat } from "@ai-sdk/react";
-import { useQueryClient } from "@tanstack/react-query";
+import { nanoid } from "nanoid";
+import { useRouter }_from "next/navigation";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
 import { toast } from "@workspace/ui/components/sonner";
-import { cn } from "@workspace/ui/lib/utils";
-import type { UIMessage } from "ai";
-import { usePathname, useSearchParams } from "next/navigation";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useMutation, useQueryClient } from "@tanstack/react-query"; // Changed
+import { apiClient, ApiError } from "@/lib/api-client"; // Changed
+import type { ApiThread } from "@/components/thread/thread-list"; // Changed
 import { ChatInput } from "./chat-input";
-import { DragDropOverlay } from "./drag-drop-overlay";
-import { Messages } from "./messages";
+import { ChatMessages } from "./chat-messages";
+import { FileWithPreview } from "@/types";
 
 interface ChatProps {
-  threadId: string;
-  initialMessages: UIMessage[];
-  initialChatModel: Model;
-  initialVisibilityType: "public" | "private";
-  isReadonly: boolean;
-  autoResume: boolean;
-  initialIsNewThread?: boolean;
-  hasKeys?: boolean;
-  user?: {
-    id: string;
-    name: string;
-  };
+  threadId?: string;
+  className?: string;
 }
 
-export const Chat = ({
-  threadId,
-  initialMessages = [],
-  initialChatModel,
-  initialVisibilityType,
-  isReadonly,
-  autoResume,
-  user,
-  initialIsNewThread = false,
-  hasKeys: hasKeysFromProps = false,
-}: ChatProps) => {
-  const queryClient = useQueryClient();
-  const { data: session } = useSession();
-  const { keys: userApiKeys, hasKeys: hasKeysFromApiKeys } = useApiKeys({
-    userId: user?.id || session?.user?.id || "anonymous",
-  });
-  const { settings: userSettings } = useUserSettings();
-  const trpcUtils = trpc.useUtils();
-  const pathname = usePathname();
-  const searchParams = useSearchParams();
-  const query = searchParams.get("query");
-  const [isNewThread, setIsNewThread] = useState(initialIsNewThread);
-  const [hasAppendedQuery, setHasAppendedQuery] = useState(false);
-  const [isAtBottom, setIsAtBottom] = useState(true);
-  const scrollToBottomRef = useRef<(() => void) | null>(null);
-  const [hasKeys, setHasKeys] = useState(hasKeysFromProps);
-
-  // Drag and drop state
-  const [isDragOverlay, setIsDragOverlay] = useState(false);
-  const [isDragOver, setIsDragOver] = useState(false);
-  const [_, setDragCounter] = useState(0);
-  const fileHandlerRef = useRef<((files: FileList) => Promise<void>) | null>(
-    null
-  );
-
-  const { mutate: generateAndUpdateThreadTitle } =
-    trpc.thread.generateAndUpdateThreadTitle.useMutation({
-      onMutate: async ({ id }) => {
-        if (!session?.user?.id) return;
-
-        await trpcUtils.thread.getUserThreads.cancel();
-        const previousThreads = trpcUtils.thread.getUserThreads.getData();
-
-        trpcUtils.thread.getUserThreads.setData(undefined, (old) => {
-          if (!old) return old;
-
-          const optimisticThread = {
-            id,
-            title: "Generating Title...",
-            userId: session.user.id,
-            originThreadId: null,
-            visibility: initialVisibilityType,
-            createdAt: new Date().toISOString(),
-            updatedAt: new Date().toISOString(),
-            lastMessageAt: new Date().toISOString(),
-          };
-
-          return [optimisticThread, ...old];
-        });
-
-        return { previousThreads };
-      },
-      onError: (error, _variables, context) => {
-        if (context?.previousThreads) {
-          trpcUtils.thread.getUserThreads.setData(
-            undefined,
-            context.previousThreads
-          );
-        }
-        toast.error(error.message || "Failed to generate thread title");
-      },
-      onSuccess: () => {
-        queryClient.invalidateQueries({
-          queryKey: [["thread", "getUserThreads"]],
-        });
-      },
-    });
+export const Chat: React.FC<ChatProps> = ({ threadId, className }) => {
+  const router = useRouter();
+  const queryClient = useQueryClient(); // Changed: useQueryClient
 
   const {
-    input,
-    experimental_resume,
-    setInput,
-    handleInputChange,
-    handleSubmit,
-    append,
-    stop,
-    data,
-    status,
     messages,
     setMessages,
-    reload,
-    error,
-  } = useChat({
-    id: threadId,
-    initialMessages,
-    experimental_throttle: 100,
-    sendExtraMessageFields: true,
-    generateId: generateUUID,
-    experimental_prepareRequestBody: ({ id, messages, requestBody }) => ({
-      id,
-      message: messages.at(-1),
-      userApiKeys,
-      forceOpenRouter: getRoutingFromCookie() ?? false,
-      userSettings: userSettings.usePersonalization ? userSettings : null,
-      ...requestBody,
-    }),
-    onError: (error) => {
-      console.error("Chat error:", error);
+    userInput,
+    setUserInput,
+    isGenerating,
+    setIsGenerating,
+    stopGeneration,
+    reloadMessage,
+    appendMessage,
+    removeMessage,
+    isLoading: isLoadingMessages, // from useMessages
+  } = useMessages({ threadId }); // This hook needs to be checked/refactored
 
-      if (error instanceof OneChatSDKError) {
-        toast.error(error.message);
-        return;
-      }
+  const { data: session } = useSession();
+  const user = session?.user;
 
-      // Handle structured error responses from API
-      if (error?.message) {
-        try {
-          const parsedError = JSON.parse(error.message);
-
-          if (parsedError.error && parsedError.code) {
-            toast.error(parsedError.error);
-            return;
-          }
-
-          if (parsedError.error) {
-            toast.error(parsedError.error);
-            return;
-          }
-
-          if (parsedError.message) {
-            toast.error(parsedError.message);
-            return;
-          }
-        } catch {
-          // If JSON parsing fails, use the raw error message
-          toast.error(error.message);
-          return;
-        }
-      }
-
-      // Fallback for any other error types
-      toast.error("An error occurred while processing your request.");
-    },
-  });
-
-  useEffect(() => {
-    if (query && !hasAppendedQuery) {
-      append({
-        role: "user",
-        content: query,
-      });
-
-      setHasAppendedQuery(true);
-      window.history.replaceState({}, "", `/thread/${threadId}`);
+  const { formRef, onKeyDown } = useEnterSubmit(async () => {
+    if (userInput.trim() || files.length > 0) {
+      await handleSendMessage();
     }
-  }, [query, append, hasAppendedQuery, threadId]);
-
-  useAutoResume({
-    autoResume,
-    initialMessages,
-    experimental_resume,
-    data,
-    setMessages,
   });
+  const { messagesRef, scrollRef, visibilityRef, scrollToBottom } =
+    useChatScrollAnchor(messages);
 
-  // biome-ignore lint/correctness/useExhaustiveDependencies: <explanation>
-  const handleSubmitMessage = useCallback(
-    (data: ChatSubmitData) => {
-      if (isNewThread)
-        window.history.replaceState({}, "", `/thread/${threadId}`);
+  const [files, setFiles] = useState<FileWithPreview[]>([]); // Assuming file handling is separate for now
 
-      const request: ChatRequest = {
-        id: threadId,
-        reasoningEffort: data.reasoningEffort,
-        selectedModel: data.selectedModel,
-        searchStrategy: data.searchStrategy,
-        forceOpenRouter: data.forceOpenRouter,
-      };
-
-      handleSubmit(undefined, {
-        body: request,
-        experimental_attachments: data.attachments,
-      });
-
-      if (isNewThread) {
-        setIsNewThread(false);
-
-        generateAndUpdateThreadTitle({
-          id: threadId,
-          userQuery: data.input,
-          apiKeys: userApiKeys,
-        });
-      }
-    },
-    [threadId, handleSubmit, isNewThread, generateAndUpdateThreadTitle]
-  );
-
-  const handleScrollStateChange = useCallback(
-    (newIsAtBottom: boolean, newScrollToBottom: () => void) => {
-      setIsAtBottom(newIsAtBottom);
-      scrollToBottomRef.current = newScrollToBottom;
-    },
-    []
-  );
-
-  useEffect(() => {
-    setHasKeys(hasKeysFromApiKeys);
-  }, [hasKeysFromApiKeys]);
-
-  const scrollToBottom = useCallback(() => {
-    scrollToBottomRef.current?.();
-  }, []);
-
-  const isStreamInterrupted = useMemo(() => {
-    return (
-      messages.length >= 1 &&
-      messages.at(-1)?.role !== "assistant" &&
-      status !== "streaming" &&
-      status !== "submitted"
-    );
-  }, [messages, status]);
-
-  // Drag and drop handlers
-  const handleDragEnter = useCallback((e: React.DragEvent) => {
-    e.preventDefault();
-    e.stopPropagation();
-
-    setDragCounter((prev) => prev + 1);
-
-    if (e.dataTransfer?.items) {
-      const hasFiles = Array.from(e.dataTransfer.items).some(
-        (item) => item.kind === "file"
+  // Mutation for generating and updating thread title
+  const generateTitleMutation = useMutation<
+    ApiThread, // Axum endpoint returns the updated thread
+    ApiError,
+    { threadId: string; userQuery: string },
+    { previousThreads?: ApiThread[] } // Context for optimistic updates
+  >({
+    mutationFn: async ({ threadId, userQuery }) => {
+      return apiClient.post<ApiThread, { userQuery: string }>(
+        `/threads/${threadId}/generate-title`,
+        { userQuery }
       );
-      if (hasFiles) {
-        setIsDragOverlay(true);
-      }
-    }
-  }, []);
-
-  const handleDragOver = useCallback((e: React.DragEvent) => {
-    e.preventDefault();
-    e.stopPropagation();
-    setIsDragOver(true);
-  }, []);
-
-  const handleDragLeave = useCallback((e: React.DragEvent) => {
-    e.preventDefault();
-    e.stopPropagation();
-
-    setDragCounter((prev) => {
-      const newCount = prev - 1;
-      if (newCount <= 0) {
-        setIsDragOverlay(false);
-        setIsDragOver(false);
-        return 0;
-      }
-      return newCount;
-    });
-  }, []);
-
-  const handleDrop = useCallback(async (e: React.DragEvent) => {
-    e.preventDefault();
-    e.stopPropagation();
-
-    setIsDragOverlay(false);
-    setIsDragOver(false);
-    setDragCounter(0);
-
-    if (!fileHandlerRef.current) return;
-
-    const files = e.dataTransfer?.files;
-    if (files && files.length > 0) {
-      await fileHandlerRef.current(files);
-    }
-  }, []);
-
-  const handleFileHandlerSet = useCallback(
-    (handler: (files: FileList) => Promise<void>) => {
-      fileHandlerRef.current = handler;
     },
-    []
-  );
+    onMutate: async ({ threadId }) => {
+      await queryClient.cancelQueries({ queryKey: ["userThreads"] });
+      const previousThreads = queryClient.getQueryData<ApiThread[]>(["userThreads"]);
+      queryClient.setQueryData<ApiThread[]>(["userThreads"], (oldThreads) =>
+        oldThreads?.map((t) =>
+          t.id === threadId ? { ...t, title: "Generating title..." } : t
+        ) ?? []
+      );
+      return { previousThreads };
+    },
+    onSuccess: (updatedThread) => {
+      toast.success("Thread title updated!");
+      queryClient.setQueryData<ApiThread[]>(["userThreads"], (oldThreads) =>
+        oldThreads?.map((t) =>
+          t.id === updatedThread.id ? updatedThread : t
+        ) ?? []
+      );
+      // If there's a query for the specific thread details, update it too
+      queryClient.setQueryData<ApiThread>(["thread", updatedThread.id], updatedThread);
+    },
+    onError: (err, variables, context) => {
+      if (context?.previousThreads) {
+        queryClient.setQueryData<ApiThread[]>(["userThreads"], context.previousThreads);
+      }
+      toast.error(`Failed to generate title: ${err.message}`);
+    },
+    onSettled: (_data, _error, variables) => {
+      queryClient.invalidateQueries({ queryKey: ["userThreads"] });
+      if (variables?.threadId) {
+        queryClient.invalidateQueries({ queryKey: ["thread", variables.threadId] });
+      }
+    },
+  });
+
+
+  const handleSendMessage = useCallback(async () => {
+    if (!user) {
+      toast.error("You must be logged in to send messages.");
+      return;
+    }
+    if (isGenerating) return;
+
+    const currentInput = userInput;
+    const currentFiles = files; // Assuming files are handled by ChatInput and passed up
+    setUserInput(""); // Clear input immediately
+    setFiles([]); // Clear files immediately
+
+    const userMessageId = nanoid();
+    appendMessage({
+      id: userMessageId,
+      role: "user",
+      content: currentInput,
+      // attachments: currentFiles, // Assuming attachments are part of message structure
+      createdAt: new Date(),
+    });
+    setIsGenerating(true);
+
+    try {
+      // This is where the actual call to send message to backend would go.
+      // The original code used Vercel AI SDK's `useChat` which handles this.
+      // We need to replicate sending the message to our Axum API
+      // and then streaming the response.
+      // This part requires significant changes as `useChat` from `ai/react`
+      // is deeply integrated with Next.js Edge runtime and Vercel's AI SDK.
+      // For now, I'll placeholder this. The `useMessages` hook will be central to this.
+
+      // Placeholder for sending message to Axum and getting response
+      // This would involve:
+      // 1. POSTing to `/api/threads/:thread_id/messages` (if threadId exists)
+      //    or POSTing to `/api/chat` (a new endpoint for starting new chats and getting back a threadId + first message)
+      // 2. Handling a streaming response from Axum if using SSE or similar.
+
+      // For now, simulate assistant response for UI testing
+      // const assistantMessageId = nanoid();
+      // appendMessage({
+      //   id: assistantMessageId,
+      //   role: "assistant",
+      //   content: "Placeholder response from assistant...",
+      //   createdAt: new Date(),
+      // });
+
+
+      // Title generation logic (if it's a new thread and first user message)
+      if (!threadId && messages.length === 0 && currentInput.trim().length > 0) {
+        // This implies a new thread was just created by the first message.
+        // The backend would handle creating the thread and returning its ID.
+        // Let's assume `handleSendMessage` in `useMessages` (once refactored)
+        // returns the new threadId.
+        // For now, this part is tricky without knowing the exact flow from useMessages.
+        //
+        // If a new thread ID is obtained after the first message is sent:
+        // const newThreadId = "some-new-thread-id-from-backend";
+        // router.push(`/chat/${newThreadId}`, { scroll: false }); // Navigate without scroll
+        // generateTitleMutation.mutate({ threadId: newThreadId, userQuery: currentInput });
+      }
+
+
+    } catch (error: any) {
+      toast.error(error.message || "An error occurred.");
+      // Potentially remove the optimistic user message if send failed.
+      removeMessage(userMessageId);
+    } finally {
+      setIsGenerating(false);
+    }
+  }, [
+    user,
+    userInput,
+    files,
+    isGenerating,
+    appendMessage,
+    removeMessage,
+    setUserInput,
+    setIsGenerating,
+    threadId,
+    messages.length, // For title generation condition
+    // generateTitleMutation, // Already a stable function from useMutation
+    // router // Stable
+  ]);
+
+  // Auto-generate title for new chats if threadId changes and it's a new thread.
+  // This effect needs to be re-evaluated. Title generation should happen after the *first message* is sent.
+  // The original logic in `threadRouter.ts` for `generateAndUpdateThreadTitle` was a mutation.
+  // It was likely called after the first user message was processed and a thread was established.
+  useEffect(() => {
+    // This effect was originally tied to `messages` and `threadId`.
+    // If `!threadId` (new chat) and `messages.length === 1` (first user message),
+    // and `messages[0].role === 'user'`, then generate title.
+    // This logic should be triggered *after* the first message is successfully sent
+    // and a `threadId` for the new chat is available.
+    // The `handleSendMessage` function is a more appropriate place to trigger this,
+    // once the new threadId is known.
+
+    // For now, commenting out, as it's complex without the full message sending logic.
+    // if (!threadId && messages.length === 1 && messages[0].role === "user") {
+    //   const firstUserMessage = messages[0].content;
+    //   if (firstUserMessage && user?.id) {
+    //     // This assumes a threadId is available immediately, which is not true for a new chat.
+    //     // This mutate call would need the *new* threadId.
+    //     // generateTitleMutation.mutate({ id: ???, userQuery: firstUserMessage });
+    //   }
+    // }
+  }, [messages, threadId, user?.id, generateTitleMutation]);
+
 
   return (
-    <section
-      className={cn(
-        "relative flex h-dvh min-w-0 flex-col bg-background",
-        isReadonly && "w-full"
-      )}
-      onDragEnter={handleDragEnter}
-      onDragOver={handleDragOver}
-      onDragLeave={handleDragLeave}
-      onDrop={handleDrop}
-      aria-label="Chat interface with file drag and drop support"
-    >
-      {!isReadonly && (
-        <div className="pointer-events-auto fixed top-2.5 right-2 z-50 flex flex-row gap-0.5 rounded-md border border-border/50 bg-neutral-50 p-1 shadow-xs backdrop-blur-sm transition-all duration-200 dark:border-border/30 dark:bg-neutral-800/90">
-          {pathname !== "/" && (
-            <ShareButton
-              threadId={threadId}
-              initialVisibility={initialVisibilityType}
-            />
-          )}
-          <ThemeButton />
-          <SettingsButton />
-        </div>
-      )}
-      <Messages
-        threadId={threadId}
-        status={status}
+    <div className={cn("flex h-[calc(100dvh)] flex-col", className)}>
+      <ChatMessages
+        ref={messagesRef}
         messages={messages}
-        setMessages={setMessages}
-        reload={reload}
-        isReadonly={isReadonly}
-        onScrollStateChange={handleScrollStateChange}
-        hasKeys={hasKeys}
-        // biome-ignore lint/style/noNonNullAssertion: <explanation>
-        username={user?.name || session?.user?.name!}
-        append={(message) => setInput(message)}
+        isLoading={isLoadingMessages}
+        isGenerating={isGenerating}
+        onStopGeneration={stopGeneration}
+        onReloadMessage={reloadMessage}
+        // Pass other necessary props
       />
-      {!isReadonly && (
-        <ChatInput
-          threadId={threadId}
-          initialChatModel={initialChatModel}
-          input={input}
-          setInput={setInput}
-          onInputChange={handleInputChange}
-          onSubmit={handleSubmitMessage}
-          status={status}
-          onStop={stop}
-          setMessages={setMessages}
-          reload={reload}
-          isAtBottom={isAtBottom}
-          scrollToBottom={scrollToBottom}
-          isStreamInterrupted={isStreamInterrupted}
-          disabled={!hasKeys}
-          onExternalFileDrop={handleFileHandlerSet}
-          error={error}
-        />
-      )}
-      <DragDropOverlay isVisible={isDragOverlay} isDragOver={isDragOver} />
-    </section>
+      <div
+        ref={scrollRef}
+        className="w-fullitems-center sticky bottom-0 z-10 flex justify-center bg-background/30 pt-2 backdrop-blur-md dark:bg-background/50"
+      >
+        <div
+          ref={visibilityRef}
+          className="mx-auto w-full max-w-3xl p-2 sm:px-4"
+        >
+          <ChatInput
+            // Pass threadId if needed by ChatInput for uploads etc.
+            threadId={threadId}
+            input={userInput}
+            onInputChange={(e) =>
+              setUserInput(typeof e === "string" ? e : e.target.value)
+            }
+            onSubmit={handleSendMessage}
+            isLoading={isGenerating || isLoadingMessages}
+          />
+        </div>
+      </div>
+    </div>
   );
 };

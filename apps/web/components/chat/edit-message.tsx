@@ -1,111 +1,81 @@
 "use client";
 
-import type { Model } from "@/lib/ai";
-import { trpc } from "@/lib/trpc/client";
-import type { MessageWithMetadata } from "@/types";
-import type { UseChatHelpers } from "@ai-sdk/react";
-import {
-  type Dispatch,
-  type SetStateAction,
-  useEffect,
-  useRef,
-  useState,
-} from "react";
+import { Button } from "@workspace/ui/components/button";
+import { useMutation, useQueryClient } from "@tanstack/react-query"; // Changed
+import { apiClient, ApiError } from "@/lib/api-client"; // Changed
+import { toast } from "@workspace/ui/components/sonner";
+import { RefreshCcw } from "lucide-react";
+import type { Message } from "ai"; // Assuming this Message type is still relevant
 
-export type EditMessageProps = {
-  message: MessageWithMetadata;
-  setMode: Dispatch<SetStateAction<"view" | "edit">>;
-  setMessages: UseChatHelpers["setMessages"];
-  reload: UseChatHelpers["reload"];
-  model: Model;
-};
+interface EditMessageProps {
+  message: Message; // This might need to be our ApiMessage type if structure differs
+  threadId: string; // Pass threadId for cache invalidation
+  // onEditSubmit: (newMessageContent: string) => void; // If inline editing was planned
+  // For now, focusing on "regenerate from here" which means deleting trailing
+}
 
-export const EditMessage = ({
+// Define the expected shape of the deletion response from Axum API
+interface DeletionResponse {
+  deleted_count: number;
+  message: string;
+}
+
+
+export const EditMessageActions: React.FC<EditMessageProps> = ({
   message,
-  setMode,
-  setMessages,
-  reload,
-  model,
-}: EditMessageProps) => {
-  const [draftContent, setDraftContent] = useState<string>(message.content);
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  threadId,
+}) => {
+  const queryClient = useQueryClient();
 
-  const deleteTrailingMessagesMutation =
-    trpc.thread.deleteTrailingMessages.useMutation();
+  const deleteTrailingMessagesMutation = useMutation<
+    DeletionResponse,
+    ApiError,
+    { messageId: string }
+  >({
+    mutationFn: async ({ messageId }) => {
+      // Axum endpoint is POST /api/messages/:message_id/delete-trailing
+      return apiClient.post(`/messages/${messageId}/delete-trailing`);
+    },
+    onSuccess: (data) => {
+      toast.success(data.message || `${data.deleted_count} message(s) deleted.`);
+      // Invalidate messages for the current thread to refetch
+      queryClient.invalidateQueries({ queryKey: ["messages", threadId] });
+      // Potentially invalidate other related queries if necessary
+      // e.g., if thread list shows last message preview:
+      queryClient.invalidateQueries({ queryKey: ["userThreads"] });
+    },
+    onError: (error) => {
+      toast.error(`Failed to delete messages: ${error.message}`);
+    },
+  });
 
-  useEffect(() => {
-    if (textareaRef.current) {
-      adjustHeight();
-    }
-  }, []);
-
-  const adjustHeight = () => {
-    if (textareaRef.current) {
-      textareaRef.current.style.height = "auto";
-      textareaRef.current.style.height = `${textareaRef.current.scrollHeight}px`;
-    }
-  };
-
-  const handleInput = (event: React.ChangeEvent<HTMLTextAreaElement>) => {
-    setDraftContent(event.target.value);
-    adjustHeight();
-  };
-
-  const handleKeyDown = async (
-    event: React.KeyboardEvent<HTMLTextAreaElement>
-  ) => {
-    if (event.key === "Enter" && !event.shiftKey) {
-      event.preventDefault();
-
-      try {
-        // @ts-expect-error todo: support UIMessage in setMessages
-        setMessages((messages) => {
-          const index = messages.findIndex((m) => m.id === message.id);
-
-          if (index !== -1) {
-            const updatedMessage = {
-              ...message,
-              content: draftContent,
-              parts: [{ type: "text", text: draftContent }],
-            };
-
-            return [...messages.slice(0, index), updatedMessage];
-          }
-
-          return messages;
-        });
-        setMode("view");
-
-        deleteTrailingMessagesMutation.mutate({
-          messageId: message.id,
-        });
-
-        reload({
-          body: {
-            selectedModel: model,
-          },
-        });
-      } catch (error) {
-        console.error("Failed to delete trailing messages:", error);
-        setMode("view");
-        reload();
-      }
+  const handleRegenerateFromHere = () => {
+    if (window.confirm("This will delete all messages after this point. Continue?")) {
+      deleteTrailingMessagesMutation.mutate({ messageId: message.id });
     }
   };
+
+  // Only show for user messages or assistant messages that are not actively streaming/ errored
+  // The original logic for when to show this might need review based on message structure
+  const canRegenerate = message.role === "user" || (message.role === "assistant" /* && message.status === 'done' (if status exists) */) ;
+
+
+  if (!canRegenerate || deleteTrailingMessagesMutation.isPending) {
+    return null;
+  }
 
   return (
-    <div className="ml-auto inline-block w-full max-w-[80%] break-words rounded-xl border px-2 py-2 text-left shadow-xs">
-      <textarea
-        ref={textareaRef}
-        className="size-full resize-none overflow-hidden border-none bg-transparent text-base text-secondary-foreground leading-6 shadow-none outline-none [vertical-align:unset] focus-visible:ring-0"
-        value={draftContent}
-        onChange={handleInput}
-        style={{
-          minHeight: "42px",
-          maxHeight: "384px",
-        }}
-        onKeyDown={handleKeyDown}
-      />
+    <div className="mt-1">
+      <Button
+        variant="ghost"
+        size="sm"
+        className="h-auto gap-1.5 px-2 py-1 text-xs text-muted-foreground hover:text-foreground"
+        onClick={handleRegenerateFromHere}
+        disabled={deleteTrailingMessagesMutation.isPending}
+      >
+        <RefreshCcw className="size-3" />
+        Regenerate from here
+      </Button>
     </div>
   );
 };

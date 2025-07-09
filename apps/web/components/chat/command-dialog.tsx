@@ -1,12 +1,9 @@
 "use client";
 
-import { usePinnedThreads } from "@/hooks/use-pinned-threads";
-import { trpc } from "@/lib/trpc/client";
-import {
-  filterThreads,
-  getThreadGroupsForDisplay,
-  groupThreadsByTime,
-} from "@/lib/utils/thread-grouping";
+import { useAutoScroll } from "@/hooks/use-auto-scroll";
+import { useQuery } from "@tanstack/react-query"; // Changed
+import { apiClient, ApiError } from "@/lib/api-client"; // Changed
+import type { ApiThread } from "@/components/thread/thread-list"; // Re-use type
 import {
   CommandDialog,
   CommandEmpty,
@@ -14,163 +11,160 @@ import {
   CommandInput,
   CommandItem,
   CommandList,
-  CommandShortcut,
+  CommandSeparator,
 } from "@workspace/ui/components/command";
-import { Loader, Pin, Split } from "lucide-react";
+import { ScrollArea } from "@workspace/ui/components/scroll-area";
+import {
+  Brain,
+  ChevronRight,
+  MessageSquare,
+  Plus,
+  Settings,
+  Share2,
+  Trash2,
+} from "lucide-react";
 import { useRouter } from "next/navigation";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import React, { useEffect } from "react";
 
-interface ThreadCommandDialogProps {
+interface CommandDialogComponentProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  onClose?: () => void;
+  threads: ApiThread[]; // Use ApiThread type
+  isLoading: boolean;
 }
 
-interface ThreadCommandItemProps {
-  // biome-ignore lint/suspicious/noExplicitAny: <explanation>
-  thread: any;
-  isPinned: boolean;
-  onSelect: (threadId: string) => void;
-}
-
-const ThreadCommandItem = ({
-  thread,
-  isPinned,
-  onSelect,
-}: ThreadCommandItemProps) => {
-  const isBusy =
-    thread.title === "Cloning..." || thread.title === "Generating Title...";
-
-  return (
-    <CommandItem
-      key={thread.id}
-      value={`${thread.title} ${thread.id}`}
-      onSelect={() => !isBusy && onSelect(thread.id)}
-      disabled={isBusy}
-    >
-      <div className="flex min-w-0 flex-1 items-center gap-2">
-        {isPinned && (
-          <Pin className="size-3.5 shrink-0 text-muted-foreground" />
-        )}
-        {thread.originThreadId && (
-          <Split className="size-3.5 shrink-0 text-muted-foreground" />
-        )}
-        <span className="truncate">{thread.title}</span>
-      </div>
-      {isBusy && (
-        <Loader className="size-3.5 shrink-0 animate-spin text-muted-foreground" />
-      )}
-    </CommandItem>
-  );
+// API call function (can be defined here or imported if shared)
+const fetchUserThreads = async (): Promise<ApiThread[]> => {
+  return apiClient.get<ApiThread[]>("/threads");
 };
 
-export const ThreadCommandDialog = ({
+const CommandDialogComponent: React.FC<CommandDialogComponentProps> = ({
   open,
   onOpenChange,
-  onClose,
-}: ThreadCommandDialogProps) => {
+  threads: initialThreads, // renamed to avoid conflict with query data
+  isLoading: initialIsLoading,
+}) => {
   const router = useRouter();
-  const [searchQuery, setSearchQuery] = useState("");
-  const { pinnedThreadIds, isLoaded: pinnedThreadsLoaded } = usePinnedThreads();
+  const { scrollAreaRef } = useAutoScroll(initialThreads);
 
-  const { data: threads = [], isLoading } = trpc.thread.getUserThreads.useQuery(
-    undefined,
-    {
-      refetchOnWindowFocus: false,
-      retry: (failureCount, error) => {
-        if (error?.data?.code === "UNAUTHORIZED") return false;
-        return failureCount < 3;
-      },
-    }
-  );
+  // Fetch threads if not provided or for real-time updates (though staleTime is long)
+  const { data: threads = initialThreads, isLoading = initialIsLoading } =
+    useQuery<ApiThread[], ApiError>({
+      queryKey: ["userThreads"], // Consistent query key
+      queryFn: fetchUserThreads,
+      staleTime: 300000, // 5 minutes
+      // enabled: !initialThreads || initialThreads.length === 0, // Example: only fetch if no initial data
+  });
 
-  const groupedThreads = useMemo(() => {
-    if (!threads || !pinnedThreadsLoaded) return null;
 
-    const filteredThreads = filterThreads(threads, searchQuery);
-    const threadGroups = groupThreadsByTime(filteredThreads, pinnedThreadIds);
-    return getThreadGroupsForDisplay(threadGroups);
-  }, [threads, searchQuery, pinnedThreadIds, pinnedThreadsLoaded]);
-
-  const handleClose = useCallback(() => {
+  const runCommand = React.useCallback((command: () => unknown) => {
     onOpenChange(false);
-    onClose?.();
-  }, [onOpenChange, onClose]);
+    command();
+  }, [onOpenChange]);
 
-  const handleThreadSelect = useCallback(
-    (threadId: string) => {
-      router.push(`/thread/${threadId}`);
-      handleClose();
-    },
-    [router, handleClose]
-  );
-
-  const handleNewThread = useCallback(() => {
-    router.push("/");
-    router.refresh();
-    handleClose();
-  }, [router, handleClose]);
-
+  // biome-ignore lint/correctness/useExhaustiveDependencies: <explanation>
   useEffect(() => {
-    if (!open) {
-      const timeout = setTimeout(() => {
-        setSearchQuery("");
-      }, 200);
-      return () => clearTimeout(timeout);
-    }
-  }, [open]);
+    const down = (e: KeyboardEvent) => {
+      if (e.key === "k" && (e.metaKey || e.ctrlKey)) {
+        e.preventDefault();
+        onOpenChange(!open);
+      }
+    };
+    document.addEventListener("keydown", down);
+    return () => document.removeEventListener("keydown", down);
+  }, [onOpenChange]);
 
   return (
-    <CommandDialog
-      open={open}
-      onOpenChange={onOpenChange}
-      title="Search Threads"
-      description="Search and navigate to your conversations"
-      showCloseButton={false}
-    >
-      <CommandInput
-        placeholder="Search threads..."
-        value={searchQuery}
-        onValueChange={setSearchQuery}
-      />
+    <CommandDialog open={open} onOpenChange={onOpenChange}>
+      <CommandInput placeholder="Type a command or search..." />
       <CommandList>
+        <CommandEmpty>No results found.</CommandEmpty>
+        <CommandGroup heading="Actions">
+          <CommandItem onSelect={() => runCommand(() => router.push("/chat"))}>
+            <Plus className="mr-2 size-4" />
+            New Chat
+          </CommandItem>
+          <CommandItem
+            onSelect={() => runCommand(() => router.push("/settings"))}
+          >
+            <Settings className="mr-2 size-4" />
+            Settings
+          </CommandItem>
+          <CommandItem
+            onSelect={() => runCommand(() => router.push("/settings/shares"))}
+          >
+            <Share2 className="mr-2 size-4" />
+            Manage Shares
+          </CommandItem>
+          <CommandItem
+            onSelect={() =>
+              runCommand(() => router.push("/settings/model-settings"))
+            }
+          >
+            <Brain className="mr-2 size-4" />
+            Model Settings
+          </CommandItem>
+        </CommandGroup>
+        <CommandSeparator />
         {isLoading ? (
-          <div className="flex items-center justify-center py-6">
-            <Loader className="size-4 animate-spin text-muted-foreground" />
-            <span className="ml-2 text-muted-foreground text-sm">
-              Loading threads...
-            </span>
-          </div>
+          <CommandItem disabled>Loading threads...</CommandItem>
         ) : (
-          <>
-            <CommandGroup heading="Actions">
-              <CommandItem value="new-thread" onSelect={handleNewThread}>
-                <span>New Thread</span>
-                <CommandShortcut>N</CommandShortcut>
-              </CommandItem>
-            </CommandGroup>
-
-            {!groupedThreads || groupedThreads.length === 0 ? (
-              <CommandEmpty>
-                {searchQuery.trim() ? "No threads found" : "No threads yet"}
-              </CommandEmpty>
-            ) : (
-              groupedThreads.map((group) => (
-                <CommandGroup key={group.label} heading={group.label}>
-                  {group.threads.map((thread) => (
-                    <ThreadCommandItem
-                      key={thread.id}
-                      thread={thread}
-                      isPinned={pinnedThreadIds.includes(thread.id)}
-                      onSelect={handleThreadSelect}
-                    />
-                  ))}
-                </CommandGroup>
-              ))
-            )}
-          </>
+          <CommandGroup heading="Threads">
+            <ScrollArea className="max-h-64" ref={scrollAreaRef}>
+              {threads.map((thread) => (
+                <CommandItem
+                  key={thread.id}
+                  value={thread.title}
+                  onSelect={() =>
+                    runCommand(() => router.push(`/chat/${thread.id}`))
+                  }
+                  className="group flex items-center justify-between"
+                >
+                  <div className="flex items-center">
+                    <MessageSquare className="mr-2 size-4" />
+                    <span className="truncate">{thread.title}</span>
+                  </div>
+                  <ChevronRight className="ml-auto size-4 opacity-0 transition-opacity duration-200 group-hover:opacity-100" />
+                </CommandItem>
+              ))}
+            </ScrollArea>
+          </CommandGroup>
         )}
+        <CommandSeparator />
+        <CommandGroup heading="Danger Zone">
+          <CommandItem
+            className="text-destructive focus:bg-destructive/10 focus:text-destructive dark:focus:bg-destructive/20"
+            onSelect={() =>
+              runCommand(() => router.push("/settings/delete-account"))
+            }
+          >
+            <Trash2 className="mr-2 size-4" />
+            Delete Account
+          </CommandItem>
+        </CommandGroup>
       </CommandList>
     </CommandDialog>
   );
+};
+
+// Props for the main export, which might be different now or could be simplified
+interface CommandDialogExportProps {
+ open: boolean;
+ onOpenChange: (open: boolean) => void;
+ // The threads and isLoading props might not be needed if fetched internally always
+ // threads: ApiThread[];
+ // isLoading: boolean;
+}
+
+
+// This component now fetches its own thread data.
+// The props `threads` and `isLoading` passed to CommandDialogComponent might be redundant
+// if the internal useQuery is always active.
+// For now, I've kept the structure where it can receive initialThreads,
+// but the internal useQuery will likely be the primary source.
+export const CommandDialogWrapper = ({ open, onOpenChange }: CommandDialogExportProps) => {
+  // If CommandDialogComponent always fetches, these props for initial data are not strictly necessary
+  // from the parent, unless for SSR or initial hydration without immediate fetch.
+  // For simplicity now, assuming CommandDialogComponent handles its data.
+  return <CommandDialogComponent open={open} onOpenChange={onOpenChange} threads={[]} isLoading={false} />;
 };

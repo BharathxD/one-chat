@@ -1,146 +1,127 @@
 "use client";
 
-import { Loader, Pin, PinOff, Split, Trash2 } from "lucide-react";
-import Link from "next/link";
-import { useParams, useRouter } from "next/navigation";
-import { useState } from "react";
-
-import { usePinnedThreads } from "@/hooks/use-pinned-threads";
-import type { ThreadListItem } from "@/lib/cache/thread-list-cache";
-import { trpc } from "@/lib/trpc/client";
-import { Button, buttonVariants } from "@workspace/ui/components/button";
-import { toast } from "@workspace/ui/components/sonner";
 import { cn } from "@workspace/ui/lib/utils";
+import { GripVertical, MessageSquare, Trash2 } from "lucide-react";
+import Link from "next/link";
+import React, { useState } from "react";
+import { Button } from "@workspace/ui/components/button";
+import { toast } from "@workspace/ui/components/sonner";
+import { useMutation, useQueryClient } from "@tanstack/react-query"; // Changed
+import { apiClient, ApiError } from "@/lib/api-client"; // Changed
+import type { ApiThread } from "./thread-list"; // Import type from sibling
 
 interface ThreadItemProps {
-  thread: ThreadListItem;
+  thread: ApiThread; // Use the new ApiThread type
+  isActive: boolean;
+  onSelect: () => void;
 }
 
-export const ThreadItem = ({ thread }: ThreadItemProps) => {
-  const router = useRouter();
-  const { isPinned, togglePin } = usePinnedThreads();
-  const [isDeleting, setIsDeleting] = useState(false);
-  const params = useParams();
+export const ThreadItem = ({
+  thread,
+  isActive,
+  onSelect,
+}: ThreadItemProps) => {
+  const [isHovered, setIsHovered] = useState(false);
+  const queryClient = useQueryClient(); // Changed: useQueryClient
 
-  const threadIdFromUrl =
-    params.id ?? window?.location?.pathname?.split("/").pop();
-
-  const isActive = threadIdFromUrl === thread.id;
-
-  const trpcUtils = trpc.useUtils();
-  const pinned = isPinned(thread.id);
-
-  const deleteThreadMutation = trpc.thread.deleteThread.useMutation({
+  const deleteThreadMutation = useMutation<
+    void, // DELETE typically returns no content (204) or simple success
+    ApiError,
+    { threadId: string },
+    { previousThreads?: ApiThread[] } // Context type for onMutate/onError
+  >({
+    mutationFn: async ({ threadId }) => {
+      return apiClient.delete(`/threads/${threadId}`); // Axum API endpoint
+    },
     onMutate: async ({ threadId }) => {
-      setIsDeleting(true);
-      if (isActive) router.push("/");
+      // Cancel any outgoing refetches (so they don't overwrite our optimistic update)
+      await queryClient.cancelQueries({ queryKey: ["userThreads"] });
 
-      await trpcUtils.thread.getUserThreads.cancel();
+      // Snapshot the previous value
+      const previousThreads = queryClient.getQueryData<ApiThread[]>([
+        "userThreads",
+      ]);
 
-      const previousThreads = trpcUtils.thread.getUserThreads.getData();
+      // Optimistically update to the new value
+      queryClient.setQueryData<ApiThread[]>(["userThreads"], (oldThreads) =>
+        oldThreads ? oldThreads.filter((t) => t.id !== threadId) : []
+      );
 
-      trpcUtils.thread.getUserThreads.setData(undefined, (old) => {
-        if (!old) return old;
-        return old.filter((t) => t.id !== threadId);
-      });
-
+      // Return a context object with the snapshotted value
       return { previousThreads };
     },
-    onError: (error, _variables, context) => {
+    onError: (err, variables, context) => {
+      toast.error(`Failed to delete thread: ${err.message}`);
+      // If the mutation fails, use the context returned from onMutate to roll back
       if (context?.previousThreads) {
-        trpcUtils.thread.getUserThreads.setData(
-          undefined,
+        queryClient.setQueryData<ApiThread[]>(
+          ["userThreads"],
           context.previousThreads
         );
       }
-      toast.error(error.message || "Failed to delete thread");
-      setIsDeleting(false);
+    },
+    onSuccess: () => {
+      toast.success("Thread deleted successfully.");
     },
     onSettled: () => {
-      setIsDeleting(false);
+      // Always refetch after error or success:
+      queryClient.invalidateQueries({ queryKey: ["userThreads"] });
     },
   });
 
-  const handleDelete = (e: React.MouseEvent) => {
-    e.preventDefault();
-    e.stopPropagation();
-    if (isDeleting) return;
-    deleteThreadMutation.mutate({ threadId: thread.id });
+  const handleDelete = (e: React.MouseEvent<HTMLButtonElement>) => {
+    e.stopPropagation(); // Prevent Link navigation
+    if (window.confirm("Are you sure you want to delete this thread?")) {
+      deleteThreadMutation.mutate({ threadId: thread.id });
+    }
   };
 
-  const handleTogglePin = (e: React.MouseEvent) => {
-    e.preventDefault();
-    e.stopPropagation();
-
-    togglePin(thread.id);
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLAnchorElement>) => {
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      onSelect();
+    }
   };
-
-  const isCloningOrGenerating =
-    thread.title === "Generating Title..." || thread.title === "Cloning...";
 
   return (
-    <div className="group/item relative">
-      <Link
-        href={`/thread/${thread.id}`}
-        className={cn(
-          buttonVariants({
-            variant: "ghost",
-            size: "sm",
-            className:
-              "rounded-lg transition-all duration-200 group-hover/item:bg-accent group-hover/item:text-accent-foreground dark:group-hover/item:bg-accent/60",
-          }),
-          "h-auto min-h-8 w-full justify-start gap-2 border border-transparent px-2 py-1.5 text-foreground",
-          isActive &&
-            "inset-shadow-xs border-border/60 bg-accent/50 text-accent-foreground dark:border-border/40 dark:bg-accent/30",
-          isDeleting && "pointer-events-none opacity-50"
-        )}
-      >
-        {pinned && <Pin className="size-3 shrink-0 text-muted-foreground" />}
-        {thread.originThreadId && (
-          <Split className="size-3 shrink-0 text-muted-foreground" />
-        )}
-        <span className="flex-1 truncate text-ellipsis text-left">
+    <Link
+      href={`/chat/${thread.id}`}
+      onClick={onSelect}
+      onKeyDown={handleKeyDown}
+      className={cn(
+        "group flex cursor-pointer items-center justify-between gap-2 rounded-lg p-2.5 text-sm text-foreground hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring dark:hover:bg-accent/60",
+        isActive && "bg-accent dark:bg-accent/60",
+        deleteThreadMutation.isPending && "opacity-50 pointer-events-none" // Visual feedback during mutation
+      )}
+      onMouseEnter={() => setIsHovered(true)}
+      onMouseLeave={() => setIsHovered(false)}
+      aria-current={isActive ? "page" : undefined}
+    >
+      <div className="flex min-w-0 flex-1 items-center gap-2">
+        <MessageSquare className="size-4 shrink-0 text-muted-foreground" />
+        <span className="min-w-0 flex-1 truncate" title={thread.title}>
           {thread.title}
         </span>
-        {isCloningOrGenerating && (
-          <div className="ml-auto flex items-center justify-center">
-            <Loader className="size-3 shrink-0 animate-spin text-muted-foreground" />
-          </div>
-        )}
-      </Link>
-
-      {!isCloningOrGenerating && (
-        <div className="-translate-y-1/2 absolute top-1/2 right-1 flex gap-1 rounded-md bg-accent opacity-0 transition-opacity group-hover/item:opacity-100">
-          <Button
-            size="icon"
-            variant="ghost"
-            className="group/pin flex size-6 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-all duration-200 hover:bg-accent hover:text-foreground dark:hover:bg-accent/60"
-            onClick={handleTogglePin}
-            title={pinned ? "Unpin thread" : "Pin thread"}
-          >
-            {pinned ? (
-              <PinOff className="mt-[1.5px] size-3 transition-transform group-hover/pin:scale-110" />
-            ) : (
-              <Pin className="mt-[1.5px] size-3 transition-transform group-hover/pin:scale-110" />
-            )}
-            <span className="sr-only">
-              {pinned ? "Unpin thread" : "Pin thread"}
-            </span>
-          </Button>
-
-          <Button
-            size="icon"
-            variant="ghost"
-            className="group/delete flex size-6 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-all duration-200 hover:bg-destructive/10 hover:text-destructive dark:hover:bg-destructive/5"
-            onClick={handleDelete}
-            disabled={isDeleting}
-            title="Delete thread"
-          >
-            <Trash2 className="size-3 transition-transform group-hover/delete:scale-110" />
-            <span className="sr-only">Delete thread</span>
-          </Button>
-        </div>
+      </div>
+      {isHovered && !isActive && (
+        <Button
+          variant="ghost"
+          size="icon"
+          className="size-6 shrink-0 hover:bg-destructive/15 hover:text-destructive dark:hover:bg-destructive/20"
+          onClick={handleDelete}
+          disabled={deleteThreadMutation.isPending}
+          aria-label="Delete thread"
+        >
+          {deleteThreadMutation.isPending ? (
+            <span className="size-3 animate-spin rounded-full border-2 border-current border-t-transparent" />
+          ) : (
+            <Trash2 className="size-3.5" />
+          )}
+        </Button>
       )}
-    </div>
+      {isActive && (
+        <GripVertical className="size-4 shrink-0 text-muted-foreground" />
+      )}
+    </Link>
   );
 };

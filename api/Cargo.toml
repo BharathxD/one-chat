@@ -1,0 +1,40 @@
+[package]
+name = "api"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+axum = { version = "0.7", features = ["macros"] } # Added macros for testing handler state
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+mongodb = { version = "2.8", features = ["bson-chrono-0_4"] }
+jsonwebtoken = "9"
+redis = { version = "0.25", features = ["tokio-comp"] }
+dotenvy = "0.15"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] } # Added json for potential test output
+chrono = { version = "0.4", features = ["serde"] }
+futures = "0.3"
+anyhow = "1.0"
+reqwest = { version = "0.12", features = ["json", "stream"] }
+base64 = "0.22"
+futures-util = { version = "0.3", default-features = false, features = ["std", "alloc", "async-await-macro"] } # Added async-await-macro for stream tests
+bytes = "1"
+axum-extra = { version = "0.9", features = ["typed-header"] } # For TypedHeader in tests if needed directly
+
+[dev-dependencies]
+tokio-test = "0.4"
+axum-test = "0.5.0" # For integration testing Axum apps. Check latest version. Or use hyper directly.
+# Note: axum-test seems to be a community crate. axum-core/axum-macros might be needed.
+# For simplicity, I'll try with basic http client approach for integration tests if axum-test is complex to setup here.
+# Let's stick to hyper/reqwest for sending requests in tests for now if `axum-test` is problematic.
+# Simpler: just use reqwest against a test server.
+# `tower-http` for some test utilities if needed.
+# `wiremock` = "0.6" # For mocking external HTTP services (AI, Vercel Blob)
+# `mockito` = "1.2.0" # Alternative for mocking
+
+# For this iteration, I will attempt tests primarily using reqwest against a test server instance
+# and direct function calls for unit tests. Wiremock/Mockito can be added if external calls become blocking.
+# I'll add `http` crate for status codes and headers if needed.
+http = "1.0"

@@ -1,541 +1,249 @@
 "use client";
-import { useApiKeys } from "@/hooks/use-api-keys";
-import { useBestModel } from "@/hooks/use-best-model";
-import { useFileHandler } from "@/hooks/use-file-handler";
-import type { Effort, Model } from "@/lib/ai/config";
-import { getModelByKey } from "@/lib/ai/models";
-import { trpc } from "@/lib/trpc/client";
-import { setModelCookie } from "@/lib/utils";
-import { getRoutingFromCookie, setRoutingCookie } from "@/lib/utils/cookie";
-import type { ChatSubmitData, SearchMode } from "@/types";
-import type { UseChatHelpers } from "@ai-sdk/react";
+
+import { useEnterSubmit } from "@/hooks/use-enter-submit";
+import { cn } from "@workspace/ui/lib/utils";
+import React, { useRef, useState } from "react";
+import Textarea from "react-textarea-autosize";
+import { useMutation, useQueryClient } from "@tanstack/react-query"; // Changed
+import { apiClient, ApiError } from "@/lib/api-client"; // Changed
 import { Button } from "@workspace/ui/components/button";
 import { toast } from "@workspace/ui/components/sonner";
-import type { Attachment } from "ai";
-import { ArrowDown, ArrowUp } from "lucide-react";
-import { AnimatePresence, motion } from "motion/react";
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { EffortButton } from "./effort-button";
-import { FileButton } from "./file-button";
-import { FilePreview } from "./file-preview";
-import { ModelSelectionPopover } from "./model-selection-popover";
-import { SearchButton } from "./search-button";
-import { VoiceButton, type VoiceButtonRef } from "./voice-button";
+import {
+  Paperclip,
+  SendHorizontal,
+  Trash2,
+  Mic,
+  Loader2,
+  X,
+} from "lucide-react";
+import { FileWithPreview } from "@/types"; // Assuming this type is still relevant
+import { useFileHandler } from "@/hooks/use-file-handler";
+import Image from "next/image";
+import { useVoiceInput } from "@/hooks/use-voice-input";
 
-interface SelectedFile {
-  fileKey: string;
-  fileUrl: string;
-  fileSize: number;
-  fileType: string;
-  fileName: string;
+interface ChatInputProps {
+  input: string;
+  onInputChange: (
+    e: React.ChangeEvent<HTMLTextAreaElement> | string
+  ) => void;
+  onSubmit: (value: string, attachments?: FileWithPreview[]) => Promise<void>;
+  isLoading: boolean;
+  threadId?: string;
+  className?: string;
 }
 
-interface StopButtonProps {
-  threadId: string;
-  onStop: () => void;
-  setMessages: UseChatHelpers["setMessages"];
-}
+export const ChatInput: React.FC<ChatInputProps> = ({
+  input,
+  onInputChange,
+  onSubmit,
+  isLoading,
+  // threadId, // threadId might be needed if file uploads are associated with a thread
+  className,
+}) => {
+  const { formRef, onKeyDown } = useEnterSubmit(async () => {
+    if (input.trim() || files.length > 0) {
+      await handleSubmit();
+    }
+  });
+  const inputRef = useRef<HTMLTextAreaElement>(null);
+  const [isFocused, setIsFocused] = useState(false);
 
-const StopButton = ({ threadId, onStop, setMessages }: StopButtonProps) => {
-  const [isStopping, setIsStopping] = useState(false);
+  const {
+    files,
+    handleFileChange,
+    removeFile,
+    MAX_FILES,
+    MAX_FILE_SIZE_MB,
+  } = useFileHandler();
 
-  const handleStop = async (event: React.MouseEvent) => {
-    event.preventDefault();
+  const queryClient = useQueryClient(); // For potential cache invalidations
 
-    if (isStopping) return;
+  // Refactored deleteAttachment mutation
+  const deleteAttachmentMutation = useMutation<
+    void,
+    ApiError,
+    { url: string }
+  >({
+    mutationFn: async ({ url }) => {
+      // Axum endpoint is POST /api/attachments/delete with body { url: string }
+      return apiClient.post("/attachments/delete", { url });
+    },
+    onSuccess: () => {
+      toast.success("Attachment removed from storage.");
+      // If attachment URLs are stored in message data, invalidate relevant message/thread queries
+      // For example: queryClient.invalidateQueries({ queryKey: ["messages", threadId] });
+    },
+    onError: (error) => {
+      toast.error(`Failed to remove attachment from storage: ${error.message}`);
+    },
+  });
 
-    setIsStopping(true);
 
-    try {
-      // Update messages state to mark as stopped
-      setMessages((messages) => {
-        // Find the last message in the array
-        const lastMessage = messages.at(-1);
-        if (!lastMessage) return messages;
-
-        if (lastMessage.role === "assistant") {
-          // If the last message is assistant, add `isStopped: true` to it
-          return [
-            ...messages.slice(0, -1),
-            {
-              ...lastMessage,
-              isStopped: true,
-            },
-          ];
-        }
-        if (lastMessage.role === "user") {
-          // If the last message is user, add a new empty assistant message with `isStopped: true`
-          return [
-            ...messages,
-            {
-              id: crypto.randomUUID(),
-              role: "assistant" as const,
-              content: "",
-              isStopped: true,
-            },
-          ];
-        }
-
-        return messages;
-      });
-
-      // Call the original onStop function
-      onStop();
-
-      await fetch(`/api/chat?chatId=${threadId}`, {
-        method: "DELETE",
-      });
-
-      toast.success("Stream stopped successfully");
-    } catch (error) {
-      console.error("Failed to stop stream:", error);
-      toast.error("Failed to stop stream. Please try again.");
-    } finally {
-      setIsStopping(false);
+  const handleRemoveFile = async (fileToRemove: FileWithPreview) => {
+    // If the file has a `url` property, it means it was uploaded and might exist in blob storage
+    if (fileToRemove.url) {
+      try {
+        await deleteAttachmentMutation.mutateAsync({ url: fileToRemove.url });
+        // If successful, then remove from local state
+        removeFile(fileToRemove);
+      } catch (error) {
+        // Error toast is handled by the mutation's onError
+      }
+    } else {
+      // If no URL, it's a local preview, just remove from local state
+      removeFile(fileToRemove);
     }
   };
 
+
+  const handleSubmit = async () => {
+    // Filter out files that are just previews (no URL yet) if onSubmit expects only uploaded files.
+    // Or, the onSubmit function itself should handle the upload process if not already done.
+    // For now, assuming `files` contains files that are ready to be associated with the message.
+    // The actual upload logic might need to happen here or within onSubmit.
+    // The original `onSubmit` took `attachments?: FileWithPreview[]`.
+    // Let's assume `FileWithPreview` can contain a `url` if uploaded.
+    await onSubmit(input, files);
+    // Clear files after submit if needed by parent
+    // files.forEach(file => removeFile(file)); // This would clear files, parent might do it
+    if (inputRef.current) {
+      inputRef.current.focus();
+    }
+  };
+
+  const {
+    isListening,
+    transcript,
+    startListening,
+    stopListening,
+    isTranscribing,
+    error: voiceError,
+  } = useVoiceInput({
+    onTranscript: (text) => onInputChange(text), // Update input with transcript
+    onError: (err) => toast.error(err),
+  });
+
+
   return (
-    <Button
-      className="rounded-full border border-border bg-background transition-colors duration-200 hover:bg-accent dark:border-border/60 dark:bg-card dark:hover:bg-accent/80"
-      size="icon"
-      onClick={handleStop}
-      disabled={isStopping}
-      title={isStopping ? "Stopping..." : "Stop generation"}
+    <div
+      className={cn(
+        "relative flex w-full flex-col gap-3 overflow-hidden rounded-xl border bg-card p-3 shadow-lg focus-within:ring-2 focus-within:ring-ring dark:bg-card/60",
+        isFocused && "ring-2 ring-ring",
+        className
+      )}
     >
-      <div className="size-3.5 rounded-xs bg-foreground dark:bg-foreground/90" />
-    </Button>
+      {/* Files Preview */}
+      {files.length > 0 && (
+        <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 md:grid-cols-4">
+          {files.map((file) => (
+            <div key={file.id || file.preview} className="relative group aspect-square">
+              {file.type.startsWith("image/") ? (
+                <Image
+                  src={file.preview}
+                  alt={file.name}
+                  fill
+                  className="rounded-md object-cover"
+                />
+              ) : (
+                <div className="flex h-full flex-col items-center justify-center rounded-md border bg-muted/30 p-2">
+                  <Paperclip className="mb-1 size-6 text-muted-foreground" />
+                  <p className="max-w-full truncate text-xs text-muted-foreground">
+                    {file.name}
+                  </p>
+                </div>
+              )}
+              <Button
+                variant="destructive"
+                size="icon"
+                className="absolute -right-2 -top-2 z-10 size-6 rounded-full opacity-0 shadow-md transition-opacity group-hover:opacity-100"
+                onClick={() => handleRemoveFile(file)}
+                aria-label={`Remove ${file.name}`}
+              >
+                <X className="size-3.5" />
+              </Button>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <form
+        ref={formRef}
+        onSubmit={(e) => {
+          e.preventDefault();
+          handleSubmit();
+        }}
+        className="flex w-full items-end gap-3"
+      >
+        {/* File Upload Button */}
+        <label
+          htmlFor="file-upload"
+          className="flex cursor-pointer items-center justify-center self-end rounded-md p-2 text-muted-foreground transition-colors duration-200 hover:text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        >
+          <Paperclip className="size-5" />
+          <input
+            id="file-upload"
+            type="file"
+            multiple
+            accept="image/*,application/pdf,text/*,.md,.json" // Adjust as needed
+            className="sr-only"
+            onChange={handleFileChange}
+            disabled={files.length >= MAX_FILES || isLoading}
+          />
+        </label>
+
+        {/* Text Input */}
+        <Textarea
+          ref={inputRef}
+          tabIndex={0}
+          onKeyDown={onKeyDown}
+          onChange={(e) => onInputChange(e)}
+          onFocus={() => setIsFocused(true)}
+          onBlur={() => setIsFocused(false)}
+          placeholder="Send a message..."
+          value={input}
+          rows={1}
+          maxRows={10}
+          spellCheck={false}
+          className="min-h-[40px] w-full resize-none scroll-p-2 border-none bg-transparent px-0 py-2 leading-relaxed shadow-none focus-visible:ring-0"
+          disabled={isLoading || isListening || isTranscribing}
+        />
+
+        {/* Voice Input Button */}
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon"
+          className="shrink-0 text-muted-foreground transition-colors duration-200 hover:text-primary focus-visible:ring-2 focus-visible:ring-ring"
+          onClick={isListening ? stopListening : startListening}
+          disabled={isLoading || isTranscribing}
+          aria-label={isListening ? "Stop listening" : "Start voice input"}
+        >
+          {isListening ? (
+            <Mic className="size-5 text-red-500" />
+          ) : isTranscribing ? (
+            <Loader2 className="size-5 animate-spin" />
+          ) : (
+            <Mic className="size-5" />
+          )}
+        </Button>
+        {voiceError && <p className="text-xs text-red-500">{voiceError}</p>}
+
+
+        {/* Submit Button */}
+        <Button
+          type="submit"
+          size="icon"
+          className="shrink-0 bg-primary text-primary-foreground shadow-md transition-all duration-200 hover:bg-primary/90 focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+          disabled={isLoading || (!input.trim() && files.length === 0)}
+          aria-label="Send message"
+        >
+          {isLoading ? (
+            <Loader2 className="size-5 animate-spin" />
+          ) : (
+            <SendHorizontal className="size-5" />
+          )}
+        </Button>
+      </form>
+    </div>
   );
 };
-
-interface ChatInputProps {
-  threadId: string;
-  initialChatModel: Model;
-  input: UseChatHelpers["input"];
-  setInput: UseChatHelpers["setInput"];
-  onInputChange: (e: React.ChangeEvent<HTMLTextAreaElement>) => void;
-  onSubmit: (data: ChatSubmitData) => void;
-  status: UseChatHelpers["status"];
-  onStop: () => void;
-  setMessages: UseChatHelpers["setMessages"];
-  reload: UseChatHelpers["reload"];
-  isAtBottom: boolean;
-  scrollToBottom: () => void;
-  isStreamInterrupted: boolean;
-  disabled?: boolean;
-  onExternalFileDrop?: (
-    handleFiles: (files: FileList) => Promise<void>
-  ) => void;
-  error?: Error;
-}
-
-const convertToAttachment = (file: SelectedFile): Attachment => ({
-  name: file.fileName,
-  contentType: file.fileType,
-  url: file.fileUrl,
-});
-
-export const ChatInput = memo(
-  ({
-    threadId,
-    input,
-    setInput,
-    initialChatModel,
-    onInputChange,
-    onSubmit,
-    status,
-    onStop,
-    setMessages,
-    reload,
-    isAtBottom,
-    scrollToBottom,
-    isStreamInterrupted,
-    disabled = false,
-    onExternalFileDrop,
-    error,
-  }: ChatInputProps) => {
-    const [reasoningEffort, setReasoningEffort] = useState<Effort>("medium");
-    const [searchStrategy, setSearchStrategy] = useState<SearchMode>("off");
-    const [selectedModel, setSelectedModel] = useState<Model>(initialChatModel);
-    const [isRestrictedToOpenRouter, setIsRestrictedToOpenRouter] =
-      useState<boolean>(getRoutingFromCookie() ?? false);
-    const [selectedFiles, setSelectedFiles] = useState<SelectedFile[]>([]);
-    const [isUploading, setIsUploading] = useState(false);
-    const [showStreamInterrupted, setShowStreamInterrupted] = useState(false);
-
-    const textareaRef = useRef<HTMLTextAreaElement>(null);
-    const voiceButtonRef = useRef<VoiceButtonRef>(null);
-    const deleteAttachment = trpc.attachment.delete.useMutation();
-    const { keys, hasOpenRouter } = useApiKeys();
-
-    useEffect(() => {
-      if (!isStreamInterrupted) {
-        setShowStreamInterrupted(false);
-        return;
-      }
-      const timeoutId = setTimeout(() => setShowStreamInterrupted(true), 1000);
-      return () => clearTimeout(timeoutId);
-    }, [isStreamInterrupted]);
-
-    useEffect(() => {
-      const hasNativeKeys = Boolean(
-        keys.openai || keys.anthropic || keys.google
-      );
-      const onlyHasOpenRouter = hasOpenRouter && !hasNativeKeys;
-      const cookieRouting = getRoutingFromCookie();
-
-      // Don't set any routing preference if user has no keys at all
-      const hasAnyKeys = hasNativeKeys || hasOpenRouter;
-      if (!hasAnyKeys) {
-        return;
-      }
-
-      // If user only has OpenRouter, force OpenRouter routing regardless of cookie
-      if (onlyHasOpenRouter) {
-        setIsRestrictedToOpenRouter(true);
-        setRoutingCookie(true);
-        return;
-      }
-
-      // If user has native keys, respect cookie preference or default to native
-      if (hasNativeKeys) {
-        const shouldUseNative = cookieRouting === null ? true : !cookieRouting;
-        setIsRestrictedToOpenRouter(!shouldUseNative);
-        if (cookieRouting === null) {
-          setRoutingCookie(false); // Default to native routing
-        }
-        return;
-      }
-    }, [keys, hasOpenRouter]);
-
-    // Auto-switch to best model when API keys change
-    useBestModel({
-      onModelChange: setSelectedModel,
-      autoSwitch: true,
-    });
-
-    const modelCapabilities = useMemo(() => {
-      const modelConfig = getModelByKey(selectedModel);
-      if (!modelConfig) {
-        return {
-          supportsEffort: false,
-          supportsSearch: false,
-          supportsFiles: false,
-          supportsTools: false,
-        };
-      }
-
-      return {
-        supportsEffort: modelConfig.capabilities.effort,
-        supportsSearch: modelConfig.capabilities.nativeSearch,
-        supportsFiles: modelConfig.supportedFileTypes.length > 0,
-        supportsTools: modelConfig.capabilities.tools,
-      };
-    }, [selectedModel]);
-
-    const handleFileChange = useCallback(
-      (file: SelectedFile) => setSelectedFiles((prev) => [...prev, file]),
-      []
-    );
-
-    const handleUploadStateChange = useCallback((uploading: boolean) => {
-      setIsUploading(uploading);
-    }, []);
-
-    const handleVoiceTranscript = useCallback(
-      (transcript: string) => {
-        // Append the transcript to the current input
-        setInput((prevInput: string) => {
-          const newInput = prevInput
-            ? `${prevInput} ${transcript}`
-            : transcript;
-          return newInput.trim();
-        });
-      },
-      [setInput]
-    );
-
-    // Set up shared file handler for drag and drop
-    const dragDropFileHandler = useFileHandler({
-      selectedModel,
-      onFileChange: handleFileChange,
-      onUploadStateChange: handleUploadStateChange,
-    });
-
-    // Expose file handling to parent via callback
-    useEffect(() => {
-      if (onExternalFileDrop) {
-        onExternalFileDrop(dragDropFileHandler.handleFiles);
-      }
-    }, [onExternalFileDrop, dragDropFileHandler.handleFiles]);
-
-    useEffect(() => {
-      // Set cookie when model changes
-      setModelCookie(selectedModel);
-    }, [selectedModel]);
-
-    const handleRemoveFile = async (file: SelectedFile) => {
-      setSelectedFiles((prev) =>
-        prev.filter((f) => f.fileKey !== file.fileKey)
-      );
-      try {
-        await deleteAttachment.mutateAsync({ url: file.fileUrl });
-      } catch (error) {
-        // Rollback
-        setSelectedFiles((prev) => {
-          const exists = prev.find((f) => f.fileKey === file.fileKey);
-          if (!exists) return [...prev, file];
-          return prev;
-        });
-        console.error("Failed to delete file:", error);
-        toast.error("Failed to delete file. Please try again.");
-      }
-    };
-
-    const handleSubmit = (
-      e: React.FormEvent<HTMLTextAreaElement> | React.FormEvent<HTMLFormElement>
-    ) => {
-      e.preventDefault();
-
-      if ((!input?.trim() && selectedFiles.length === 0) || disabled) {
-        return;
-      }
-
-      // Stop voice transcription when submitting
-      voiceButtonRef.current?.stop();
-
-      const attachments: Attachment[] | undefined =
-        selectedFiles.length > 0
-          ? selectedFiles.map(convertToAttachment)
-          : undefined;
-
-      onSubmit({
-        input,
-        selectedModel,
-        reasoningEffort,
-        searchStrategy,
-        attachments,
-        forceOpenRouter: isRestrictedToOpenRouter,
-      });
-
-      setSelectedFiles([]);
-    };
-
-    // biome-ignore lint/correctness/useExhaustiveDependencies: The input is used to determine the height of the textarea
-    useEffect(() => {
-      if (textareaRef.current) {
-        textareaRef.current.style.height = "auto";
-        textareaRef.current.style.height = `${textareaRef.current.scrollHeight}px`;
-      }
-    }, [input]);
-
-    // Determine if we can submit
-    const canSubmit = input?.trim();
-    const isProcessing = status === "streaming";
-    const cannotSubmit = !canSubmit || isProcessing || isUploading;
-
-    return (
-      <div className="sticky inset-x-0 bottom-0 z-10 mx-auto flex w-full gap-2 border-border/20 bg-background/60 px-2 pb-2 backdrop-blur-sm sm:px-4 sm:pb-4 md:max-w-3xl md:pb-6">
-        <div className="relative flex w-full flex-col">
-          <div className="-top-12 -translate-x-1/2 absolute left-1/2">
-            <AnimatePresence>
-              {!isAtBottom && (
-                <motion.div
-                  initial={{ opacity: 0, y: 10 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  exit={{ opacity: 0, y: 10 }}
-                  transition={{ type: "spring", stiffness: 300, damping: 20 }}
-                >
-                  <Button
-                    className="rounded-full border border-border bg-background transition-colors duration-200 hover:bg-accent dark:border-border/60 dark:bg-card dark:hover:bg-accent/80"
-                    size="icon"
-                    variant="outline"
-                    onClick={(event) => {
-                      event.preventDefault();
-                      scrollToBottom();
-                    }}
-                  >
-                    <ArrowDown className="size-4 text-foreground dark:text-foreground/90" />
-                  </Button>
-                </motion.div>
-              )}
-            </AnimatePresence>
-          </div>
-          {/* Error Display */}
-          {status === "error" && (
-            <div className="mx-auto w-[95%] rounded-lg rounded-b-none border border-destructive/30 border-b-0 bg-destructive/10 p-2 dark:border-destructive/20 dark:bg-destructive/5">
-              <div className="flex items-center justify-between">
-                <p className="text-destructive text-sm sm:text-base dark:text-destructive/90">
-                  {error?.message}
-                </p>
-                {reload && (
-                  <Button
-                    onClick={async () =>
-                      await reload({
-                        body: {
-                          selectedModel,
-                        },
-                      })
-                    }
-                    size="sm"
-                    variant="outline"
-                    className="h-6 rounded-sm border-destructive/30 bg-destructive/10 text-destructive transition-colors duration-200 hover:bg-destructive/20 dark:border-destructive/20 dark:bg-destructive/5 dark:text-destructive/90 dark:hover:bg-destructive/10"
-                  >
-                    Retry
-                  </Button>
-                )}
-              </div>
-            </div>
-          )}
-
-          {/* Interrupted Stream Display */}
-          {status !== "error" && showStreamInterrupted && (
-            <div className="mx-auto w-[95%] rounded-lg rounded-b-none border border-amber-300/30 border-b-0 bg-amber-50/80 p-2 pl-3 dark:border-amber-400/20 dark:bg-amber-900/20">
-              <div className="flex items-center justify-between">
-                <p className="text-amber-700 text-sm sm:text-base dark:text-amber-300">
-                  Stream was interrupted or stopped
-                </p>
-                {reload && (
-                  <Button
-                    onClick={async () =>
-                      await reload({
-                        body: {
-                          selectedModel,
-                        },
-                      })
-                    }
-                    size="sm"
-                    variant="outline"
-                    className="h-6 rounded-sm border-amber-300/30 bg-amber-50/80 text-amber-700 transition-colors duration-200 hover:bg-amber-100/80 dark:border-amber-400/20 dark:bg-amber-900/20 dark:text-amber-300 dark:hover:bg-amber-800/30"
-                  >
-                    Retry
-                  </Button>
-                )}
-              </div>
-            </div>
-          )}
-
-          {/* Input Form */}
-          <form
-            onSubmit={handleSubmit}
-            className="relative w-full rounded-xl border border-border bg-muted/30 shadow-xs backdrop-blur-sm transition-all duration-200 focus-within:border-border/80 focus-within:shadow-md dark:border-border/60 dark:bg-card/50 dark:shadow-none dark:focus-within:border-border/80 dark:focus-within:shadow-lg"
-          >
-            <textarea
-              ref={textareaRef}
-              value={input}
-              disabled={disabled}
-              onChange={onInputChange}
-              style={{
-                minHeight: "42px",
-                maxHeight: "384px",
-              }}
-              spellCheck={false}
-              className="w-full flex-1 resize-none overflow-auto bg-transparent p-2 pb-1.5 text-foreground outline-none ring-0 transition-colors duration-200 placeholder:text-muted-foreground disabled:opacity-50 sm:p-3"
-              placeholder={
-                isProcessing
-                  ? "AI is responding..."
-                  : isUploading
-                    ? "Uploading files..."
-                    : "Ask me anything..."
-              }
-              onKeyDown={(e) => {
-                if (e.key === "Enter" && !e.shiftKey) {
-                  e.preventDefault();
-                  if (!cannotSubmit) {
-                    handleSubmit(e);
-                  }
-                }
-              }}
-            />
-
-            {/* File previews */}
-            {selectedFiles.length > 0 && (
-              <div className="border-border/30 border-t px-2 pt-2 sm:px-3 dark:border-border/20">
-                <div className="flex flex-wrap gap-2 overflow-x-auto">
-                  {selectedFiles.map((file) => (
-                    <FilePreview
-                      key={file.fileKey}
-                      fileName={file.fileName}
-                      fileType={file.fileType}
-                      fileSize={file.fileSize}
-                      onRemove={async () => await handleRemoveFile(file)}
-                      fileUrl={file.fileUrl}
-                    />
-                  ))}
-                </div>
-              </div>
-            )}
-
-            <div className="flex items-center gap-1 p-2 sm:gap-2 sm:p-3">
-              <div className="flex items-end gap-0.5 sm:gap-1">
-                <ModelSelectionPopover
-                  selectedModel={selectedModel}
-                  onSelect={setSelectedModel}
-                  isRestrictedToOpenRouter={isRestrictedToOpenRouter}
-                  onIsRestrictedToOpenRouterChange={setIsRestrictedToOpenRouter}
-                  disabled={disabled}
-                />
-                {modelCapabilities.supportsEffort && (
-                  <EffortButton
-                    effort={reasoningEffort}
-                    onEffortChange={setReasoningEffort}
-                    disabled={disabled}
-                  />
-                )}
-                {(modelCapabilities.supportsTools ||
-                  modelCapabilities.supportsSearch) && (
-                  <SearchButton
-                    searchMode={searchStrategy}
-                    onSearchModeChange={setSearchStrategy}
-                    supportsNativeSearch={modelCapabilities.supportsSearch}
-                    disabled={disabled}
-                  />
-                )}
-                {modelCapabilities.supportsFiles && (
-                  <FileButton
-                    selectedModel={selectedModel}
-                    onFileChange={handleFileChange}
-                    onUploadStateChange={handleUploadStateChange}
-                    disabled={isProcessing || disabled}
-                  />
-                )}
-                <VoiceButton
-                  ref={voiceButtonRef}
-                  onTranscript={handleVoiceTranscript}
-                  disabled={isProcessing || disabled}
-                />
-              </div>
-              <div className="ml-auto flex items-center gap-0.5 sm:gap-1">
-                {status === "submitted" || status === "streaming" ? (
-                  <StopButton
-                    threadId={threadId}
-                    onStop={onStop}
-                    setMessages={setMessages}
-                  />
-                ) : (
-                  <Button
-                    type="submit"
-                    size="icon"
-                    className="rounded-lg bg-primary text-primary-foreground transition-all duration-200 hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-primary dark:hover:bg-primary/90"
-                    disabled={cannotSubmit || disabled}
-                    title={
-                      isUploading
-                        ? "Files are uploading..."
-                        : isProcessing
-                          ? "AI is responding..."
-                          : canSubmit
-                            ? "Send message"
-                            : "Enter a message"
-                    }
-                  >
-                    <ArrowUp className="size-4" />
-                  </Button>
-                )}
-              </div>
-            </div>
-          </form>
-        </div>
-      </div>
-    );
-  }
-);

@@ -1,284 +1,148 @@
 "use client";
 
-import { useApiKeys } from "@/hooks/use-api-keys";
-import { trpc } from "@/lib/trpc/client";
 import { Button } from "@workspace/ui/components/button";
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-} from "@workspace/ui/components/dropdown-menu";
 import { toast } from "@workspace/ui/components/sonner";
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipTrigger,
-} from "@workspace/ui/components/tooltip";
-import { cn } from "@workspace/ui/lib/utils";
-import { Loader, Square, Volume2 } from "lucide-react";
-import { memo, useCallback, useEffect, useRef, useState } from "react";
-import { ProviderIcon } from "./model-selection-popover";
+import { useMutation } from "@tanstack/react-query"; // Changed
+import { apiClient, ApiError } from "@/lib/api-client"; // Changed
+import { useUserSettings } from "@/hooks/use-user-settings"; // To get API keys
+import { Loader2, Play, StopCircle } from "lucide-react";
+import React, { useEffect, useRef, useState } from "react";
 
-interface TTSButtonProps {
+interface TextToSpeechButtonProps {
   text: string;
-  className?: string;
-  onOpenChange: (open: boolean) => void;
-  isOpen: boolean;
+  disabled?: boolean;
 }
 
-type TTSModel =
-  | "gpt-4o-mini-tts"
-  | "tts-1"
-  | "tts-1-hd"
-  | "gemini-2.5-flash-preview-tts"
-  | "gemini-2.5-pro-preview-tts";
+// Define payload and response types matching Axum API
+interface TextToSpeechPayload {
+  text: string;
+  voice?: string;
+  model?: string;
+  speed?: number;
+  apiKey?: string; // User's API key for the selected provider
+  provider?: "openai" | "google";
+}
 
-type TTSProvider = "openai" | "google";
+interface TextToSpeechResponse {
+  audio: string; // base64 encoded audio
+  format: string; // e.g., "mp3" or "wav"
+  voice: string;
+  text_length: number;
+}
 
-const TTS_MODELS: {
-  id: TTSModel;
-  name: string;
-  description: string;
-  provider: TTSProvider;
-  defaultVoice: string;
-}[] = [
-  {
-    id: "gpt-4o-mini-tts",
-    name: "GPT-4o Mini TTS",
-    description: "Fast & efficient",
-    provider: "openai",
-    defaultVoice: "alloy",
-  },
-  {
-    id: "tts-1",
-    name: "TTS-1",
-    description: "Standard quality",
-    provider: "openai",
-    defaultVoice: "alloy",
-  },
-  {
-    id: "tts-1-hd",
-    name: "TTS-1 HD",
-    description: "High quality",
-    provider: "openai",
-    defaultVoice: "alloy",
-  },
-  {
-    id: "gemini-2.5-flash-preview-tts",
-    name: "Gemini 2.5 Flash TTS",
-    description: "Google's fast TTS",
-    provider: "google",
-    defaultVoice: "Kore",
-  },
-  {
-    id: "gemini-2.5-pro-preview-tts",
-    name: "Gemini 2.5 Pro TTS",
-    description: "Google's premium TTS",
-    provider: "google",
-    defaultVoice: "Kore",
-  },
-];
+export const TextToSpeechButton: React.FC<TextToSpeechButtonProps> = ({
+  text,
+  disabled,
+}) => {
+  const [isPlaying, setIsPlaying] = useState(false);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const { settings } = useUserSettings(); // For API keys and TTS preferences
 
-export const TTSButton = memo<TTSButtonProps>(
-  ({ text, className, onOpenChange, isOpen }) => {
-    const { keys } = useApiKeys();
-    const currentAudioRef = useRef<HTMLAudioElement | null>(null);
-    const [isPlaying, setIsPlaying] = useState(false);
-
-    const stopAudio = useCallback(() => {
-      if (currentAudioRef.current) {
-        currentAudioRef.current.pause();
-        currentAudioRef.current.currentTime = 0;
-        currentAudioRef.current = null;
-        setIsPlaying(false);
-      }
-    }, []);
-
-    const generateSpeech = trpc.voice.textToSpeech.useMutation({
-      onSuccess: (data) => {
-        try {
-          // Stop any currently playing audio
-          stopAudio();
-
-          if (!data?.audio) {
-            toast.error("Failed to generate speech");
-            return;
-          }
-
-          // Create audio element and play
-          const audio = new Audio(
-            `data:audio/${data?.format};base64,${data?.audio}`
-          );
-
-          currentAudioRef.current = audio;
-          setIsPlaying(true);
-
-          // Handle audio end
-          audio.onended = () => {
-            setIsPlaying(false);
-            currentAudioRef.current = null;
-          };
-
-          // Handle audio error
-          audio.onerror = () => {
-            console.error("Audio playback failed");
-            toast.error("Audio playback failed");
-            setIsPlaying(false);
-            currentAudioRef.current = null;
-          };
-
-          audio.play();
-        } catch (error) {
-          console.error("Failed to play audio:", error);
-          toast.error("Failed to play audio");
+  const generateSpeechMutation = useMutation<
+    TextToSpeechResponse,
+    ApiError,
+    TextToSpeechPayload
+  >({
+    mutationFn: async (payload) => {
+      return apiClient.post<TextToSpeechResponse, TextToSpeechPayload>(
+        "/voice/tts",
+        payload
+      );
+    },
+    onSuccess: (data) => {
+      const audioSrc = `data:audio/${data.format};base64,${data.audio}`;
+      if (audioRef.current) {
+        audioRef.current.src = audioSrc;
+        audioRef.current.play().catch(err => {
+          toast.error("Failed to play audio automatically.");
+          console.error("Audio play error:", err);
           setIsPlaying(false);
-        }
-      },
-      onError: (error) => {
-        toast.error(error.message);
-        setIsPlaying(false);
-      },
-    });
-
-    const handleModelSelect = useCallback(
-      (model: TTSModel) => {
-        if (!text.trim()) {
-          toast.error("No text to convert to speech");
-          return;
-        }
-
-        if (text.length > 4000) {
-          toast.error(`Text is too long (${text.length}/4000 characters)`);
-          return;
-        }
-
-        const modelConfig = TTS_MODELS.find((m) => m.id === model);
-        if (!modelConfig) return;
-
-        const apiKey =
-          modelConfig.provider === "openai" ? keys.openai : keys.google;
-
-        generateSpeech.mutate({
-          text: text.trim(),
-          model,
-          voice: modelConfig.defaultVoice,
-          speed: 1.0,
-          provider: modelConfig.provider,
-          apiKey: apiKey || undefined,
         });
-      },
-      [text, generateSpeech, keys.openai, keys.google]
-    );
+        setIsPlaying(true);
+      }
+    },
+    onError: (error) => {
+      toast.error(`Speech generation failed: ${error.message}`);
+      setIsPlaying(false);
+    },
+  });
 
-    // Cleanup audio on unmount
-    useEffect(() => {
-      return () => {
-        stopAudio();
-      };
-    }, [stopAudio]);
+  const handlePlayPause = () => {
+    if (isPlaying && audioRef.current) {
+      audioRef.current.pause();
+      audioRef.current.currentTime = 0; // Reset audio
+      setIsPlaying(false);
+    } else if (text) {
+      const provider = settings.ttsProvider || "openai";
+      let apiKey: string | undefined;
+      if (provider === "openai") {
+        apiKey = settings.openaiApiKey;
+      } else if (provider === "google") {
+        apiKey = settings.googleApiKey; // Assuming settings structure
+      }
 
-    const isLoading = generateSpeech.isPending;
-    const hasOpenAIKey = Boolean(keys.openai);
-    const hasGoogleKey = Boolean(keys.google);
-    const isTextTooLong = text.length > 4000;
-    const isDisabled = (isLoading && !isPlaying) || !text.trim();
+      if (!apiKey) {
+        toast.error(
+          `${
+            provider.charAt(0).toUpperCase() + provider.slice(1)
+          } API key not set. Please configure it in settings.`
+        );
+        return;
+      }
 
-    const handleButtonClick = () => {
-      if (isPlaying) {
-        stopAudio();
+      generateSpeechMutation.mutate({
+        text,
+        voice: settings.ttsVoice || (provider === "openai" ? "alloy" : "elevenlabs-alloy"), // Default based on provider
+        model: settings.ttsModel || (provider === "openai" ? "gpt-4o-mini-tts" : "gemini-2.5-flash-preview-tts"),
+        speed: settings.ttsSpeed || 1.0,
+        apiKey,
+        provider: provider as "openai" | "google",
+      });
+    }
+  };
+
+  // Cleanup audio element on unmount
+  useEffect(() => {
+    const currentAudio = audioRef.current;
+    return () => {
+      if (currentAudio) {
+        currentAudio.pause();
+        currentAudio.src = "";
       }
     };
+  }, []);
 
-    return (
-      <DropdownMenu onOpenChange={onOpenChange} open={isOpen && !isPlaying}>
-        <Tooltip>
-          <TooltipTrigger asChild>
-            {isPlaying ? (
-              <Button
-                variant="ghost"
-                size="icon"
-                className={cn("group/tts", className)}
-                onClick={handleButtonClick}
-              >
-                <Square
-                  size={14}
-                  className="text-muted-foreground group-hover/tts:text-foreground"
-                />
-              </Button>
-            ) : (
-              <DropdownMenuTrigger asChild>
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  className={cn("group/tts", className)}
-                  disabled={isDisabled}
-                >
-                  {isLoading ? (
-                    <Loader className="size-4 animate-spin" />
-                  ) : (
-                    <Volume2
-                      size={14}
-                      className="text-muted-foreground group-hover/tts:text-foreground"
-                    />
-                  )}
-                </Button>
-              </DropdownMenuTrigger>
-            )}
-          </TooltipTrigger>
-          <TooltipContent side="bottom">
-            {isPlaying
-              ? "Stop audio"
-              : isLoading
-                ? "Generating speech..."
-                : isTextTooLong
-                  ? `Speech - Text too long (${text.length}/4000 characters)`
-                  : "Text to Speech"}
-          </TooltipContent>
-        </Tooltip>
+  // Listen for audio end to reset playing state
+  useEffect(() => {
+    if (audioRef.current) {
+      const handleAudioEnd = () => setIsPlaying(false);
+      audioRef.current.addEventListener("ended", handleAudioEnd);
+      return () => {
+        audioRef.current?.removeEventListener("ended", handleAudioEnd);
+      };
+    }
+  }, [audioRef.current]);
 
-        <DropdownMenuContent
-          side="bottom"
-          align="end"
-          className="w-48"
-          sideOffset={4}
-        >
-          {!hasOpenAIKey && !hasGoogleKey && (
-            <div className="px-3 pt-2 text-start">
-              <span className="font-medium text-muted-foreground text-sm">
-                Add OpenAI or Gemini API key to use TTS
-              </span>
-            </div>
-          )}
 
-          {TTS_MODELS.map((model) => {
-            const canUseModel =
-              model.provider === "openai" ? hasOpenAIKey : hasGoogleKey;
-
-            return (
-              <DropdownMenuItem
-                key={model.id}
-                onClick={() => handleModelSelect(model.id)}
-                disabled={!canUseModel || isLoading}
-                className="flex items-center gap-3 px-3 py-2.5"
-              >
-                <ProviderIcon
-                  provider={model.provider}
-                  className="size-4 flex-shrink-0"
-                />
-                <div className="flex flex-col items-start gap-1">
-                  <span className="font-medium text-sm">{model.name}</span>
-                  <span className="text-muted-foreground text-xs">
-                    {model.description}
-                  </span>
-                </div>
-              </DropdownMenuItem>
-            );
-          })}
-        </DropdownMenuContent>
-      </DropdownMenu>
-    );
-  }
-);
-
-TTSButton.displayName = "TTSButton";
+  return (
+    <>
+      <Button
+        variant="ghost"
+        size="icon"
+        className="size-7 text-muted-foreground transition-colors hover:text-foreground"
+        onClick={handlePlayPause}
+        disabled={disabled || generateSpeechMutation.isPending || !text.trim()}
+        aria-label={isPlaying ? "Stop speech" : "Play speech"}
+      >
+        {generateSpeechMutation.isPending ? (
+          <Loader2 className="size-3.5 animate-spin" />
+        ) : isPlaying ? (
+          <StopCircle className="size-3.5" />
+        ) : (
+          <Play className="size-3.5" />
+        )}
+      </Button>
+      <audio ref={audioRef} className="hidden" />
+    </>
+  );
+};

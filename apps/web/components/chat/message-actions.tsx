@@ -1,233 +1,119 @@
-import { type Model, getModelByKey } from "@/lib/ai";
-import { trpc } from "@/lib/trpc/client";
-import type { MessageWithMetadata } from "@/types";
+"use client";
+
+import { useMutation, useQueryClient } from "@tanstack/react-query"; // Changed
+import { apiClient, ApiError } from "@/lib/api-client"; // Changed
 import { Button } from "@workspace/ui/components/button";
-import { CopyButton } from "@workspace/ui/components/copy-button";
 import { toast } from "@workspace/ui/components/sonner";
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipTrigger,
-} from "@workspace/ui/components/tooltip";
-import { cn } from "@workspace/ui/lib/utils";
-import { LinkIcon, PencilIcon, RotateCcwIcon, Split } from "lucide-react";
+import { Copy, Share2, Check } from "lucide-react";
+import { useState } from "react";
 import { nanoid } from "nanoid";
-import { memo, useState } from "react";
-import { ModelSelectionDropdown } from "./model-selection-dropdown";
-import { ProviderIcon } from "./model-selection-popover";
-import { TTSButton } from "./tts-button";
+import type { Message } from "ai"; // Assuming this is still relevant for message prop
+import { env } from "@/env";
 
 interface MessageActionsProps {
-  message: MessageWithMetadata;
-  model?: Model;
-  isReadonly: boolean;
-  onReload: (model?: Model) => void;
-  onEdit: () => void;
-  onBranchOut: (model?: Model) => void;
-  onCopy: (text: string) => void;
-  isReloading: boolean;
-  isBranching: boolean;
-  textContent: string;
+  message: Message; // This might be our ApiMessage type
   threadId: string;
-  isMobileActionsVisible?: boolean;
+  // className?: string;
 }
 
-export const MessageActions = memo<MessageActionsProps>(
-  ({
-    message,
-    model,
-    isReadonly,
-    onReload,
-    onEdit,
-    onBranchOut,
-    onCopy,
-    isReloading,
-    isBranching,
-    textContent,
-    threadId,
-    isMobileActionsVisible = false,
-  }) => {
-    const [isReloadDropdownOpen, setIsReloadDropdownOpen] = useState(false);
-    const [isBranchDropdownOpen, setIsBranchDropdownOpen] = useState(false);
-    const [isTTSDropdownOpen, setIsTTSDropdownOpen] = useState(false);
+// Define the expected response shape for creating a partial share
+export interface ApiPartialShareResponse {
+  token: string;
+  threadId: string;
+  userId: string;
+  sharedUpToMessageId: string; // Ensure camelCase matches Axum response if transformed
+  createdAt: string;
+}
 
-    const createPartialShareMutation =
-      trpc.thread.createPartialShare.useMutation();
 
-    const handlePartialShare = () => {
-      const token = nanoid(12);
-      const shareUrl = `${window.location.origin}/share/partial/${token}`;
+export const MessageActions: React.FC<MessageActionsProps> = ({
+  message,
+  threadId,
+}) => {
+  const [copied, setCopied] = useState(false);
+  const queryClient = useQueryClient();
 
-      const sharePromise = new Promise((resolve, reject) => {
-        createPartialShareMutation.mutate(
-          {
-            threadId,
-            messageId: message.id,
-            token,
-          },
-          {
-            onSuccess: () => {
-              navigator.clipboard.writeText(shareUrl);
-              resolve({ shareUrl });
-            },
-            onError: (error) => {
-              reject(error);
-            },
-          }
-        );
-      });
+  const handleCopy = () => {
+    if (typeof message.content === "string") {
+      navigator.clipboard.writeText(message.content);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } else {
+      // Handle non-string content if necessary (e.g. complex UI content)
+      toast.error("Cannot copy this message type.");
+    }
+  };
 
-      toast.promise(sharePromise, {
-        loading: "Creating share link...",
-        success: () => {
-          return "Partial share link copied to clipboard!";
-        },
-        error: (error) => {
-          return error?.message || "Failed to create partial share";
-        },
-      });
-    };
+  const createShareLinkMutation = useMutation<
+    ApiPartialShareResponse,
+    ApiError,
+    { threadId: string; messageId: string; token?: string }
+  >({
+    mutationFn: async ({ threadId, messageId, token }) => {
+      return apiClient.post<ApiPartialShareResponse, { thread_id: string; shared_up_to_message_id: string; token?: string }>(
+        "/shares",
+        { thread_id: threadId, shared_up_to_message_id: messageId, token }
+      );
+    },
+    onSuccess: (data) => {
+      const shareUrl = `${env.NEXT_PUBLIC_APP_URL}/share/${data.token}`;
+      navigator.clipboard.writeText(shareUrl);
+      toast.success(`Share link copied to clipboard: ${shareUrl}`);
+      queryClient.invalidateQueries({ queryKey: ["userPartialShares"] });
+    },
+    onError: (error) => {
+      toast.error(`Failed to create share link: ${error.message}`);
+    },
+  });
 
-    if (isReadonly) return null;
+  const handleShare = () => {
+    createShareLinkMutation.mutate({
+      threadId: threadId,
+      messageId: message.id, // Assuming message.id is the correct ID for sharing up to
+      token: nanoid(10), // Generate a client-side token suggestion
+    });
+  };
 
-    const modelConfig = model && getModelByKey(model);
-    const isAnyDropdownOpen =
-      isReloadDropdownOpen || isBranchDropdownOpen || isTTSDropdownOpen;
+  // Show actions for assistant messages or user messages that are not empty.
+  // (Original logic might have been more nuanced based on message types/status)
+  const showActions = message.role !== "system" && message.content;
 
-    return (
-      <div
-        className={cn(
-          "absolute mt-2 flex items-center gap-1 opacity-0 transition-opacity group-focus-within:opacity-100 group-hover:opacity-100 group-focus:opacity-100",
-          {
-            "right-0": message.role === "user",
-            "left-0": message.role === "assistant",
-            "opacity-100": isAnyDropdownOpen || isMobileActionsVisible,
-          }
-        )}
-      >
-        {modelConfig && message.role === "assistant" && (
-          <div className="mr-2 flex flex-shrink-0 items-center whitespace-nowrap rounded-md bg-muted px-2 py-1 text-muted-foreground text-xs">
-            <ProviderIcon provider={modelConfig.provider} className="size-3" />
-            <span className="ml-1">{modelConfig.name}</span>
-          </div>
-        )}
-
-        <ModelSelectionDropdown
-          trigger={
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  className="group/edit"
-                  disabled={isReloading}
-                >
-                  <RotateCcwIcon
-                    size={14}
-                    className="text-muted-foreground group-hover/edit:text-foreground"
-                  />
-                </Button>
-              </TooltipTrigger>
-              <TooltipContent side="bottom">
-                Regenerate from here
-              </TooltipContent>
-            </Tooltip>
-          }
-          onSelect={(model) => onReload(model)}
-          onOpenChange={setIsReloadDropdownOpen}
-          disabled={isReloading}
-          side="bottom"
-          align="end"
-        />
-
-        {message.role === "user" && (
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <Button
-                variant="ghost"
-                size="icon"
-                className="group/edit"
-                onClick={onEdit}
-              >
-                <PencilIcon
-                  size={14}
-                  className="text-muted-foreground group-hover/edit:text-foreground"
-                />
-              </Button>
-            </TooltipTrigger>
-            <TooltipContent side="bottom">Edit message</TooltipContent>
-          </Tooltip>
-        )}
-
-        {message.role !== "user" && (
-          <ModelSelectionDropdown
-            trigger={
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    className="group/edit"
-                    disabled={isBranching}
-                  >
-                    <Split
-                      size={14}
-                      className={cn(
-                        "text-muted-foreground group-hover/edit:text-foreground",
-                        {
-                          "animate-pulse": isBranching,
-                        }
-                      )}
-                    />
-                  </Button>
-                </TooltipTrigger>
-                <TooltipContent side="bottom">
-                  {isBranching ? "Branching..." : "Branch Out"}
-                </TooltipContent>
-              </Tooltip>
-            }
-            onSelect={(model) => onBranchOut(model)}
-            onOpenChange={setIsBranchDropdownOpen}
-            disabled={isBranching}
-            side="bottom"
-            align="end"
-          />
-        )}
-
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <Button
-              variant="ghost"
-              size="icon"
-              className="group/edit"
-              onClick={handlePartialShare}
-            >
-              <LinkIcon
-                size={14}
-                className="text-muted-foreground group-hover/edit:text-foreground"
-              />
-            </Button>
-          </TooltipTrigger>
-          <TooltipContent side="bottom">Share up to here</TooltipContent>
-        </Tooltip>
-
-        {message.role === "assistant" && (
-          <TTSButton
-            text={textContent}
-            onOpenChange={setIsTTSDropdownOpen}
-            isOpen={isTTSDropdownOpen}
-          />
-        )}
-
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <CopyButton onCopy={() => onCopy(textContent)} />
-          </TooltipTrigger>
-          <TooltipContent side="bottom">Copy message</TooltipContent>
-        </Tooltip>
-      </div>
-    );
+  if (!showActions) {
+    return null;
   }
-);
 
-MessageActions.displayName = "MessageActions";
+  return (
+    <div className="mt-1 flex items-center gap-1">
+      <Button
+        variant="ghost"
+        size="icon"
+        className="size-7 text-muted-foreground transition-colors hover:text-foreground"
+        onClick={handleCopy}
+        aria-label="Copy message"
+      >
+        {copied ? (
+          <Check className="size-3.5" />
+        ) : (
+          <Copy className="size-3.5" />
+        )}
+      </Button>
+      {message.role === "assistant" && ( // Or based on other conditions if sharing user messages is allowed
+        <Button
+          variant="ghost"
+          size="icon"
+          className="size-7 text-muted-foreground transition-colors hover:text-foreground"
+          onClick={handleShare}
+          disabled={createShareLinkMutation.isPending}
+          aria-label="Share thread up to this message"
+        >
+          {createShareLinkMutation.isPending ? (
+             <span className="size-3 animate-spin rounded-full border-2 border-current border-t-transparent" />
+          ) : (
+            <Share2 className="size-3.5" />
+          )}
+        </Button>
+      )}
+      {/* Add other actions like Edit (from EditMessageActions) or Regenerate here if needed */}
+    </div>
+  );
+};
